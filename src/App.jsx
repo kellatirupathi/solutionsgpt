@@ -1,9 +1,23 @@
 import React, { useEffect, useMemo, useRef, useState } from 'react'
 import ReactMarkdown from 'react-markdown'
 import remarkGfm from 'remark-gfm'
-import { generateSolutionArchitectResponse } from './lib/openai'
+import mammoth from 'mammoth'
+import * as pdfjsLib from 'pdfjs-dist'
+import pdfWorker from 'pdfjs-dist/build/pdf.worker.min.mjs?url'
+import * as XLSX from 'xlsx'
+import { streamSolutionArchitectResponse } from './lib/openai'
 
 const STORAGE_KEY = 'solution-architect-gpt-chats'
+const MAX_ATTACHMENT_CHARS = 12000
+const MAX_TOTAL_ATTACHMENT_CHARS = 24000
+const ACCENT_SURFACE_CLASS =
+  'border-[#cfe0f5] bg-[#edf5ff] text-slate-800 shadow-[0_12px_30px_rgba(125,147,178,0.14)]'
+const ACCENT_SURFACE_HOVER_CLASS =
+  'hover:border-[#bfd5ee] hover:bg-[#e4f0ff]'
+const ACCENT_INPUT_SURFACE_CLASS =
+  'border-[#cfe0f5] bg-[#f2f8ff] shadow-[0_18px_42px_rgba(125,147,178,0.16)] ring-1 ring-white/80'
+const ACCENT_ICON_BUTTON_CLASS =
+  'bg-white text-slate-500 shadow-sm ring-1 ring-[#cfe0f5] transition hover:bg-[#e8f2ff] hover:text-slate-700'
 const conversationStarters = [
   'Suggest the right solution for gyms to track paid members and daily attendance',
   'Use Case: Salon Problem: losing repeat customers after first visit',
@@ -20,7 +34,22 @@ function App() {
   const [loadingSteps, setLoadingSteps] = useState([])
   const [loadingStepIndex, setLoadingStepIndex] = useState(0)
   const [isSidebarOpen, setIsSidebarOpen] = useState(false)
+  const [attachedFiles, setAttachedFiles] = useState([])
+  const [isParsingFiles, setIsParsingFiles] = useState(false)
+  const [attachmentError, setAttachmentError] = useState('')
+  const [isListening, setIsListening] = useState(false)
+  const [speechSupported, setSpeechSupported] = useState(false)
+  const [speechError, setSpeechError] = useState('')
   const messagesEndRef = useRef(null)
+  const requestAbortRef = useRef(null)
+  const fileInputRef = useRef(null)
+  const textAreaRef = useRef(null)
+  const speechRecognitionRef = useRef(null)
+  const speechFinalTranscriptRef = useRef('')
+  const speechShouldContinueRef = useRef(false)
+  const uploadedFileIdsRef = useRef([])
+
+  pdfjsLib.GlobalWorkerOptions.workerSrc = pdfWorker
 
   const activeChat = useMemo(
     () => chats.find((chat) => chat.id === activeChatId) || null,
@@ -103,50 +132,137 @@ function App() {
     messagesEndRef.current?.scrollIntoView({ behavior: 'smooth', block: 'end' })
   }, [messages, loading, error])
 
+  useEffect(() => {
+    const RecognitionApi = window.SpeechRecognition || window.webkitSpeechRecognition
+    setSpeechSupported(Boolean(RecognitionApi))
+  }, [])
+
+  useEffect(() => {
+    const textArea = textAreaRef.current
+
+    if (!textArea) {
+      return
+    }
+
+    textArea.style.height = '0px'
+    textArea.style.height = `${Math.min(textArea.scrollHeight, 144)}px`
+  }, [businessInput])
+
+  useEffect(() => () => {
+    requestAbortRef.current?.abort()
+    speechShouldContinueRef.current = false
+    speechRecognitionRef.current?.stop()
+  }, [])
+
   async function handleAnalyze(overrideInput) {
     const trimmedInput = (overrideInput ?? businessInput).trim()
+    const composedInput = buildComposedInput({
+      input: trimmedInput,
+      attachedFiles,
+    })
 
-    if (!trimmedInput || loading || !activeChat) {
+    if ((!trimmedInput && attachedFiles.length === 0) || loading || !activeChat) {
       return
     }
 
     const userMessage = {
       id: crypto.randomUUID(),
       role: 'user',
-      content: trimmedInput,
+      content: composedInput,
       createdAt: new Date().toISOString(),
     }
 
+    const assistantMessageId = crypto.randomUUID()
+    const assistantMessage = {
+      id: assistantMessageId,
+      role: 'assistant',
+      content: '',
+      createdAt: new Date().toISOString(),
+      isStreaming: true,
+    }
+
     const nextMessages = [...messages, userMessage]
+    const optimisticMessages = [...nextMessages, assistantMessage]
 
     setChats((current) =>
       current.map((chat) =>
         chat.id === activeChat.id
           ? {
               ...chat,
-              title: chat.messages.length === 0 ? buildChatTitle(trimmedInput) : chat.title,
+              title: chat.messages.length === 0 ? buildChatTitle(trimmedInput || attachedFiles[0]?.name || 'New request') : chat.title,
               updatedAt: new Date().toISOString(),
-              messages: nextMessages,
+              messages: optimisticMessages,
             }
           : chat,
       ),
     )
 
     setBusinessInput('')
+    setAttachedFiles([])
+    uploadedFileIdsRef.current = []
+    setAttachmentError('')
     setError('')
+    setSpeechError('')
     setLoadingSteps(buildLoadingSteps(trimmedInput))
     setLoading(true)
 
+    requestAbortRef.current?.abort()
+    const abortController = new AbortController()
+    requestAbortRef.current = abortController
+
     try {
-      const result = await generateSolutionArchitectResponse({
+      let streamedContent = ''
+
+      const result = await streamSolutionArchitectResponse({
         messages: nextMessages,
+        signal: abortController.signal,
+        onChunk: (chunk) => {
+          streamedContent += chunk
+
+          setChats((current) =>
+            current.map((chat) =>
+              chat.id === activeChat.id
+                ? {
+                    ...chat,
+                    updatedAt: new Date().toISOString(),
+                    messages: chat.messages.map((message) =>
+                      message.id === assistantMessageId
+                        ? {
+                            ...message,
+                            content: streamedContent,
+                            isStreaming: true,
+                          }
+                        : message,
+                    ),
+                  }
+                : chat,
+            ),
+          )
+        },
       })
 
-      const assistantMessage = {
-        id: crypto.randomUUID(),
-        role: 'assistant',
-        content: result,
-        createdAt: new Date().toISOString(),
+      setChats((current) =>
+        current.map((chat) =>
+          chat.id === activeChat.id
+            ? {
+                ...chat,
+                updatedAt: new Date().toISOString(),
+                messages: chat.messages.map((message) =>
+                  message.id === assistantMessageId
+                    ? {
+                        ...message,
+                        content: result,
+                        isStreaming: false,
+                      }
+                    : message,
+                ),
+              }
+            : chat,
+        ),
+      )
+    } catch (err) {
+      if (err.name === 'AbortError') {
+        return
       }
 
       setChats((current) =>
@@ -155,14 +271,16 @@ function App() {
             ? {
                 ...chat,
                 updatedAt: new Date().toISOString(),
-                messages: [...nextMessages, assistantMessage],
+                messages: chat.messages.filter((message) => message.id !== assistantMessageId),
               }
             : chat,
         ),
       )
-    } catch (err) {
       setError(err.message)
     } finally {
+      if (requestAbortRef.current === abortController) {
+        requestAbortRef.current = null
+      }
       setLoading(false)
     }
   }
@@ -175,17 +293,28 @@ function App() {
   }
 
   function handleNewChat() {
+    requestAbortRef.current?.abort()
+    stopSpeechRecognition()
     const newChat = createNewChat()
     setChats((current) => [newChat, ...current])
     setActiveChatId(newChat.id)
     setBusinessInput('')
+    setAttachedFiles([])
+    uploadedFileIdsRef.current = []
+    setAttachmentError('')
     setError('')
+    setSpeechError('')
     setLoading(false)
     setLoadingSteps([])
     setIsSidebarOpen(false)
   }
 
   function handleDeleteChat(chatId) {
+    if (activeChatId === chatId) {
+      requestAbortRef.current?.abort()
+      stopSpeechRecognition()
+    }
+
     const remainingChats = chats.filter((chat) => chat.id !== chatId)
 
     if (remainingChats.length === 0) {
@@ -205,11 +334,161 @@ function App() {
     if (activeChatId === chatId) {
       setActiveChatId(remainingChats[0].id)
       setBusinessInput('')
+      setAttachedFiles([])
+      uploadedFileIdsRef.current = []
+      setAttachmentError('')
       setError('')
+      setSpeechError('')
       setLoading(false)
       setLoadingSteps([])
       setIsSidebarOpen(false)
     }
+  }
+
+  async function handleFileSelection(event) {
+    const files = Array.from(event.target.files || [])
+
+    if (files.length === 0) {
+      return
+    }
+
+    const nextPendingFiles = files
+      .filter((file) => !uploadedFileIdsRef.current.includes(buildFileFingerprint(file)))
+      .map((file) => buildPendingAttachmentRecord(file))
+
+    if (nextPendingFiles.length === 0) {
+      setAttachmentError('Those files are already attached.')
+      event.target.value = ''
+      return
+    }
+
+    setSpeechError('')
+    setAttachmentError('')
+    setIsParsingFiles(true)
+    uploadedFileIdsRef.current = [
+      ...uploadedFileIdsRef.current,
+      ...nextPendingFiles.map((file) => file.fingerprint),
+    ]
+
+    setAttachedFiles((current) => trimAttachments([...current, ...nextPendingFiles]))
+
+    try {
+      for (const pendingFile of nextPendingFiles) {
+        const parsedFile = await parseAttachmentFile(pendingFile.file)
+
+        setAttachedFiles((current) =>
+          trimAttachments(
+            current.map((file) => (file.id === pendingFile.id ? parsedFile : file)),
+          ),
+        )
+      }
+    } catch {
+      setAttachmentError('Some files could not be fully processed.')
+    } finally {
+      setIsParsingFiles(false)
+    }
+
+    event.target.value = ''
+  }
+
+  function handleRemoveAttachedFile(fileId) {
+    setAttachedFiles((current) => {
+      const fileToRemove = current.find((file) => file.id === fileId)
+
+      if (fileToRemove?.fingerprint) {
+        uploadedFileIdsRef.current = uploadedFileIdsRef.current.filter(
+          (fingerprint) => fingerprint !== fileToRemove.fingerprint,
+        )
+      }
+
+      return current.filter((file) => file.id !== fileId)
+    })
+  }
+
+  function handleOpenFilePicker() {
+    fileInputRef.current?.click()
+  }
+
+  function handleSpeechToggle() {
+    if (isListening) {
+      stopSpeechRecognition()
+      return
+    }
+
+    const RecognitionApi = window.SpeechRecognition || window.webkitSpeechRecognition
+
+    if (!RecognitionApi) {
+      setSpeechError('Speech-to-text is not supported in this browser.')
+      return
+    }
+
+    speechShouldContinueRef.current = true
+    const recognition = new RecognitionApi()
+    recognition.lang = 'en-IN'
+    recognition.interimResults = true
+    recognition.continuous = true
+
+    speechFinalTranscriptRef.current = businessInput.trim()
+      ? `${businessInput.trim()} `
+      : ''
+
+    recognition.onstart = () => {
+      setIsListening(true)
+      setSpeechError('')
+    }
+
+    recognition.onresult = (event) => {
+      let interimTranscript = ''
+      let finalTranscript = speechFinalTranscriptRef.current
+
+      for (let index = event.resultIndex; index < event.results.length; index += 1) {
+        const result = event.results[index]
+        const transcript = result[0]?.transcript || ''
+
+        if (result.isFinal) {
+          finalTranscript += `${transcript.trim()} `
+        } else {
+          interimTranscript += transcript
+        }
+      }
+
+      speechFinalTranscriptRef.current = finalTranscript
+      setBusinessInput(`${finalTranscript}${interimTranscript}`.trim())
+    }
+
+    recognition.onerror = (event) => {
+      speechShouldContinueRef.current = false
+      setSpeechError(getSpeechErrorMessage(event.error))
+      setIsListening(false)
+    }
+
+    recognition.onend = () => {
+      const shouldRestart = speechShouldContinueRef.current
+      speechRecognitionRef.current = null
+      setIsListening(false)
+
+      if (shouldRestart) {
+        window.setTimeout(() => {
+          if (!speechShouldContinueRef.current) {
+            return
+          }
+
+          handleSpeechToggle()
+        }, 150)
+        return
+      }
+
+    }
+
+    speechRecognitionRef.current = recognition
+    recognition.start()
+  }
+
+  function stopSpeechRecognition() {
+    speechShouldContinueRef.current = false
+    speechRecognitionRef.current?.stop()
+    speechRecognitionRef.current = null
+    setIsListening(false)
   }
 
   return (
@@ -235,7 +514,7 @@ function App() {
             <button
               type="button"
               onClick={handleNewChat}
-              className="mb-3 inline-flex w-full items-center justify-center rounded-2xl bg-slate-900 px-4 py-3 text-sm font-medium text-white transition hover:bg-slate-800"
+              className={`mb-3 inline-flex w-full items-center justify-center rounded-2xl border px-4 py-3 text-sm font-medium transition ${ACCENT_SURFACE_CLASS} ${ACCENT_SURFACE_HOVER_CLASS}`}
             >
               New Chat
             </button>
@@ -253,7 +532,7 @@ function App() {
                   key={chat.id}
                   className={`group relative rounded-xl border transition ${
                     chat.id === activeChatId
-                      ? 'border-slate-900 bg-slate-900 text-white'
+                      ? `${ACCENT_SURFACE_CLASS}`
                       : 'border-slate-200 bg-white text-slate-700 hover:border-slate-300'
                   }`}
                 >
@@ -277,7 +556,7 @@ function App() {
                     }}
                     className={`absolute right-2 top-2 inline-flex h-6 w-6 items-center justify-center rounded-full transition ${
                       chat.id === activeChatId
-                        ? 'text-slate-300 opacity-0 hover:bg-white/10 hover:text-white group-hover:opacity-100'
+                        ? 'text-slate-500 opacity-0 hover:bg-white/60 hover:text-slate-700 group-hover:opacity-100'
                         : 'text-slate-400 opacity-0 hover:bg-slate-100 hover:text-slate-700 group-hover:opacity-100'
                     }`}
                     aria-label="Delete chat"
@@ -328,8 +607,8 @@ function App() {
                     <div
                       className={
                         message.role === 'user'
-                          ? 'w-auto max-w-[92%] rounded-[20px] bg-slate-900 px-4 py-3 text-[14px] leading-6 text-white shadow-sm sm:max-w-[85%] sm:rounded-[22px] sm:px-5 sm:py-3.5 md:max-w-[78%] lg:max-w-2xl'
-                          : 'w-full rounded-[22px] bg-white px-4 py-4 text-slate-700 shadow-sm ring-1 ring-slate-200 sm:rounded-[24px] sm:px-5 sm:py-5 lg:rounded-[28px]'
+                          ? 'w-auto max-w-[92%] rounded-[20px] border border-[#cfe0f5] bg-[#edf5ff] px-4 py-3 text-[14px] leading-6 text-slate-800 shadow-[0_10px_24px_rgba(125,147,178,0.12)] sm:max-w-[85%] sm:rounded-[22px] sm:px-5 sm:py-3.5 md:max-w-[78%] lg:max-w-2xl'
+                          : 'w-full px-1 py-1 text-slate-700 sm:px-2 sm:py-2 lg:max-w-none'
                       }
                     >
                       {message.role === 'user' ? (
@@ -432,7 +711,9 @@ function App() {
                         </div>
                         <div className="min-w-0">
                           <p className="text-[13px] font-medium leading-5 text-slate-700 sm:text-[14px]">
-                            {loadingSteps[loadingStepIndex] || 'Analyzing request'}
+                            {findStreamingMessage(messages)?.content
+                              ? 'Generating response live'
+                              : loadingSteps[loadingStepIndex] || 'Analyzing request'}
                           </p>
                         </div>
                       </div>
@@ -455,24 +736,90 @@ function App() {
 
           <div className="sticky bottom-0 px-3 pb-3 pt-2 sm:px-5 sm:pb-4 md:px-6 lg:px-8">
             <div className="mx-auto max-w-5xl">
-              <div className="flex items-end gap-2 rounded-[20px] bg-white px-2.5 py-2 shadow-lg ring-1 ring-slate-200 sm:gap-3 sm:rounded-[22px] sm:px-3 sm:py-2.5 md:rounded-[24px]">
-                <textarea
-                  value={businessInput}
-                  onChange={(event) => setBusinessInput(event.target.value)}
-                  onKeyDown={handleKeyDown}
-                  placeholder="Describe the business problem..."
-                  className="max-h-28 min-h-[42px] flex-1 resize-none border-0 bg-transparent px-2.5 py-2 text-[14px] leading-6 text-slate-900 outline-none placeholder:text-slate-400 sm:max-h-32 sm:min-h-[44px] sm:px-3 sm:py-2.5 sm:text-[15px]"
-                />
-                <button
-                  type="button"
-                  onClick={handleAnalyze}
-                  disabled={loading || !businessInput.trim()}
-                  className="inline-flex h-9 w-9 shrink-0 items-center justify-center rounded-full bg-slate-900 text-white transition hover:bg-slate-800 disabled:cursor-not-allowed disabled:bg-slate-300 sm:h-10 sm:w-10"
-                  aria-label="Send"
-                >
-                  <SendIcon />
-                </button>
+              <input
+                ref={fileInputRef}
+                type="file"
+                multiple
+                onChange={handleFileSelection}
+                accept=".txt,.md,.json,.csv,.pdf,.doc,.docx,.rtf,.xlsx,.xls,.ppt,.pptx"
+                className="hidden"
+              />
+              <div className={`rounded-[20px] border px-2.5 py-2 sm:rounded-[22px] sm:px-3 sm:py-2.5 md:rounded-[24px] ${ACCENT_INPUT_SURFACE_CLASS}`}>
+                {attachedFiles.length > 0 ? (
+                  <div className="mb-2 flex flex-wrap gap-2 px-1">
+                    {attachedFiles.map((file) => (
+                      <div
+                        key={file.id}
+                        className="inline-flex max-w-full items-center gap-2 rounded-full border border-slate-200 bg-slate-50 px-3 py-1.5 text-xs text-slate-700"
+                      >
+                        <span className="truncate">{file.name}</span>
+                        <span className="text-slate-400">{file.statusLabel}</span>
+                        <button
+                          type="button"
+                          onClick={() => handleRemoveAttachedFile(file.id)}
+                          className="text-slate-400 transition hover:text-slate-700"
+                          aria-label={`Remove ${file.name}`}
+                        >
+                          ×
+                        </button>
+                      </div>
+                    ))}
+                  </div>
+                ) : null}
+
+                <div className="flex items-end gap-2 sm:gap-3">
+                  <button
+                    type="button"
+                    onClick={handleOpenFilePicker}
+                    className="inline-flex h-10 w-10 shrink-0 items-center justify-center rounded-full text-slate-700 transition hover:bg-white/70"
+                    aria-label="Attach files"
+                  >
+                    <PlusIcon />
+                  </button>
+
+                  <textarea
+                    ref={textAreaRef}
+                    value={businessInput}
+                    onChange={(event) => setBusinessInput(event.target.value)}
+                    onKeyDown={handleKeyDown}
+                    placeholder="Describe the business problem..."
+                    className="min-h-[42px] max-h-36 flex-1 resize-none overflow-y-auto border-0 bg-transparent px-1 py-2 text-[14px] leading-6 text-slate-800 outline-none placeholder:text-slate-400 sm:min-h-[44px] sm:text-[15px]"
+                  />
+
+                  <button
+                    type="button"
+                    onClick={handleSpeechToggle}
+                    disabled={!speechSupported}
+                    className={`inline-flex h-10 w-10 shrink-0 items-center justify-center rounded-full transition ${
+                      isListening
+                        ? 'bg-white text-rose-600 shadow-sm ring-1 ring-[#cfe0f5]'
+                        : `text-slate-600 disabled:cursor-not-allowed disabled:text-slate-300 ${ACCENT_ICON_BUTTON_CLASS}`
+                    }`}
+                    aria-label={isListening ? 'Stop voice input' : 'Start voice input'}
+                  >
+                    <MicIcon />
+                  </button>
+
+                  <button
+                    type="button"
+                    onClick={() => handleAnalyze()}
+                    disabled={loading || (!businessInput.trim() && attachedFiles.length === 0)}
+                    className={`inline-flex h-10 w-10 shrink-0 items-center justify-center rounded-full disabled:cursor-not-allowed disabled:bg-white/80 disabled:text-slate-300 ${ACCENT_ICON_BUTTON_CLASS}`}
+                    aria-label="Send"
+                  >
+                    <SendArrowIcon />
+                  </button>
+                </div>
               </div>
+              {isParsingFiles ? (
+                <p className="mt-2 px-1 text-xs text-slate-500">Processing attached files...</p>
+              ) : null}
+              {attachmentError ? (
+                <p className="mt-2 px-1 text-xs text-rose-600">{attachmentError}</p>
+              ) : null}
+              {speechError ? (
+                <p className="mt-2 px-1 text-xs text-rose-600">{speechError}</p>
+              ) : null}
             </div>
           </div>
         </section>
@@ -904,8 +1251,57 @@ function normalizeAssistantMarkdown(content) {
 
   return content
     .split('\n')
-    .map((line) => convertStandaloneBoldToHeading(stripLeadingEmoji(line)))
+    .map((line) =>
+      cleanAssistantLine(
+        convertStandaloneBoldToHeading(
+          normalizeBrokenBoldSyntax(stripLeadingEmoji(line)),
+        ),
+      ),
+    )
+    .filter((line, index, lines) => {
+      if (isDividerLine(line)) {
+        return false
+      }
+
+      if (line === '' && lines[index - 1] === '') {
+        return false
+      }
+
+      return true
+    })
     .join('\n')
+}
+
+function SendArrowIcon() {
+  return (
+    <svg viewBox="0 0 24 24" fill="none" className="h-5 w-5" stroke="currentColor" strokeWidth="2">
+      <path d="M12 19V5" strokeLinecap="round" />
+      <path d="m6 11 6-6 6 6" strokeLinecap="round" strokeLinejoin="round" />
+    </svg>
+  )
+}
+
+function PlusIcon() {
+  return (
+    <svg viewBox="0 0 24 24" fill="none" className="h-5 w-5" stroke="currentColor" strokeWidth="2">
+      <path d="M12 5v14" strokeLinecap="round" />
+      <path d="M5 12h14" strokeLinecap="round" />
+    </svg>
+  )
+}
+
+function MicIcon() {
+  return (
+    <svg viewBox="0 0 24 24" fill="none" className="h-5 w-5" stroke="currentColor" strokeWidth="2">
+      <path d="M12 15a3 3 0 0 0 3-3V8a3 3 0 1 0-6 0v4a3 3 0 0 0 3 3Z" />
+      <path d="M19 11a7 7 0 0 1-14 0" strokeLinecap="round" />
+      <path d="M12 18v3" strokeLinecap="round" />
+    </svg>
+  )
+}
+
+function findStreamingMessage(messages = []) {
+  return [...messages].reverse().find((message) => message.role === 'assistant' && message.isStreaming)
 }
 
 function stripLeadingEmoji(line) {
@@ -917,13 +1313,257 @@ function stripLeadingEmoji(line) {
 
 function convertStandaloneBoldToHeading(line) {
   const trimmed = line.trim()
-  const match = trimmed.match(/^\*\*(.+?)\*\*$/)
+  const match = trimmed.match(/^\*\*+\s*(.+?)\s*\*+$/)
 
   if (!match) {
     return line
   }
 
-  return `## ${match[1].trim()}`
+  return `## ${stripBoldMarkers(match[1]).trim()}`
+}
+
+function cleanAssistantLine(line) {
+  return stripBoldMarkers(removeDecorativeIcons(line))
+    .replace(/\*\*\s*\*\*/g, '')
+    .replace(/\s{2,}/g, ' ')
+    .replace(/\s+$/g, '')
+}
+
+function removeDecorativeIcons(line) {
+  return line.replace(/[\p{Extended_Pictographic}\uFE0F\u200D]+/gu, '')
+}
+
+function normalizeBrokenBoldSyntax(line) {
+  return line
+    .replace(/^\*\*\s+(.+?)\s*\*\*$/g, '**$1**')
+    .replace(/:\*\*\s+\*\*(.+?)$/g, ': $1')
+    .replace(/([^\s])\*\*\s+\*\*(.+?)$/g, '$1 $2')
+    .replace(/\*\*\s+\*\*(.+?)$/g, '$1')
+}
+
+function stripBoldMarkers(line) {
+  return line
+    .replace(/^(#{1,6}\s*)\*\*+\s*(.+?)\s*\*+$/g, '$1$2')
+    .replace(/^([*-]\s+)\*\*+\s*(.+?)\s*\*+$/g, '$1$2')
+    .replace(/^(\d+\.\s+)\*\*+\s*(.+?)\s*\*+$/g, '$1$2')
+    .replace(/^>\s*\*\*+\s*(.+?)\s*\*+$/g, '> $1')
+    .replace(/\*\*+\s*([^*]+?)\s*\*+/g, '$1')
+}
+
+function isDividerLine(line) {
+  return /^\s*(?:---+|\*\*\*+|___+)\s*$/.test(line)
+}
+
+function buildComposedInput({ input, attachedFiles }) {
+  const normalizedInput = input.trim()
+
+  if (attachedFiles.length === 0) {
+    return normalizedInput
+  }
+
+  const attachmentSections = attachedFiles
+    .map((file) => {
+      const content = file.extractedText?.trim()
+      const details = [`File: ${file.name}`, `Type: ${file.typeLabel}`]
+
+      if (content) {
+        details.push(`Extracted Content:\n${content}`)
+      } else {
+        details.push(`Notes: ${file.note}`)
+      }
+
+      return details.join('\n')
+    })
+    .join('\n\n')
+
+  return [normalizedInput, 'Attached File Context:', attachmentSections].filter(Boolean).join('\n\n')
+}
+
+async function parseAttachmentFile(file) {
+  const extension = file.name.split('.').pop()?.toLowerCase() || ''
+  const id = crypto.randomUUID()
+  const fingerprint = buildFileFingerprint(file)
+
+  try {
+    if (extension === 'pdf') {
+      const extractedText = await extractPdfText(file)
+      return buildAttachmentRecord({
+        id,
+        fingerprint,
+        file,
+        extractedText,
+        statusLabel: 'PDF extracted',
+      })
+    }
+
+    if (extension === 'docx' || extension === 'doc') {
+      const extractedText = await extractDocxText(file)
+      return buildAttachmentRecord({
+        id,
+        fingerprint,
+        file,
+        extractedText,
+        statusLabel: 'Document extracted',
+      })
+    }
+
+    if (extension === 'xlsx' || extension === 'xls') {
+      const extractedText = await extractSpreadsheetText(file)
+      return buildAttachmentRecord({
+        id,
+        fingerprint,
+        file,
+        extractedText,
+        statusLabel: 'Spreadsheet extracted',
+      })
+    }
+
+    if (['txt', 'md', 'json', 'csv', 'rtf'].includes(extension)) {
+      const extractedText = await file.text()
+      return buildAttachmentRecord({
+        id,
+        fingerprint,
+        file,
+        extractedText,
+        statusLabel: 'Text extracted',
+      })
+    }
+
+    return buildAttachmentRecord({
+      id,
+      fingerprint,
+      file,
+      extractedText: '',
+      statusLabel: 'Metadata only',
+      note: 'This file type is attached by name only. Content extraction is not supported in-browser yet.',
+    })
+  } catch {
+    return buildAttachmentRecord({
+      id,
+      fingerprint,
+      file,
+      extractedText: '',
+      statusLabel: 'Read failed',
+      note: 'The file could not be parsed, so only its name will be included in the request.',
+    })
+  }
+}
+
+function buildPendingAttachmentRecord(file) {
+  return {
+    id: crypto.randomUUID(),
+    fingerprint: buildFileFingerprint(file),
+    file,
+    name: file.name,
+    size: file.size,
+    type: file.type,
+    typeLabel: file.type || 'Unknown',
+    extractedText: '',
+    statusLabel: 'Processing...',
+    note: '',
+  }
+}
+
+function buildAttachmentRecord({ id, fingerprint, file, extractedText, statusLabel, note }) {
+  return {
+    id,
+    fingerprint,
+    name: file.name,
+    size: file.size,
+    type: file.type,
+    typeLabel: file.type || 'Unknown',
+    extractedText: limitAttachmentText(extractedText),
+    statusLabel,
+    note: note || '',
+  }
+}
+
+function trimAttachments(files) {
+  let totalChars = 0
+
+  return files.map((file) => {
+    if (!file.extractedText) {
+      return file
+    }
+
+    const remainingChars = Math.max(MAX_TOTAL_ATTACHMENT_CHARS - totalChars, 0)
+    const nextText = file.extractedText.slice(0, remainingChars)
+    totalChars += nextText.length
+
+    return {
+      ...file,
+      extractedText: nextText,
+      statusLabel:
+        nextText.length < file.extractedText.length ? `${file.statusLabel} (trimmed)` : file.statusLabel,
+    }
+  })
+}
+
+function limitAttachmentText(text) {
+  return (text || '').replace(/\0/g, '').trim().slice(0, MAX_ATTACHMENT_CHARS)
+}
+
+function buildFileFingerprint(file) {
+  return [file.name, file.size, file.lastModified].join(':')
+}
+
+async function extractPdfText(file) {
+  const buffer = await file.arrayBuffer()
+  const pdf = await pdfjsLib.getDocument({ data: buffer }).promise
+  const pageTexts = []
+
+  for (let pageNumber = 1; pageNumber <= pdf.numPages; pageNumber += 1) {
+    const page = await pdf.getPage(pageNumber)
+    const content = await page.getTextContent()
+    const pageText = content.items.map((item) => item.str || '').join(' ')
+    pageTexts.push(pageText)
+  }
+
+  return pageTexts.join('\n')
+}
+
+async function extractDocxText(file) {
+  const buffer = await file.arrayBuffer()
+  const result = await mammoth.extractRawText({ arrayBuffer: buffer })
+  return result.value || ''
+}
+
+async function extractSpreadsheetText(file) {
+  const buffer = await file.arrayBuffer()
+  const workbook = XLSX.read(buffer, { type: 'array' })
+
+  return workbook.SheetNames.map((sheetName) => {
+    const sheet = workbook.Sheets[sheetName]
+    const rows = XLSX.utils.sheet_to_json(sheet, { header: 1, defval: '' })
+    const content = rows
+      .map((row) => row.map((cell) => String(cell).trim()).filter(Boolean).join(' | '))
+      .filter(Boolean)
+      .join('\n')
+
+    return [`Sheet: ${sheetName}`, content].filter(Boolean).join('\n')
+  })
+    .filter(Boolean)
+    .join('\n\n')
+}
+
+function getSpeechErrorMessage(errorCode) {
+  if (errorCode === 'not-allowed' || errorCode === 'service-not-allowed') {
+    return 'Microphone access was blocked.'
+  }
+
+  if (errorCode === 'audio-capture') {
+    return 'No microphone was found for speech input.'
+  }
+
+  if (errorCode === 'network') {
+    return 'Speech recognition failed because the browser lost network access.'
+  }
+
+  if (errorCode === 'no-speech') {
+    return 'No speech was detected. Try again and speak after the mic turns on.'
+  }
+
+  return 'Speech recognition failed.'
 }
 
 export default App
