@@ -40,6 +40,7 @@ function App() {
   const [isListening, setIsListening] = useState(false)
   const [speechSupported, setSpeechSupported] = useState(false)
   const [speechError, setSpeechError] = useState('')
+  const [streamStatus, setStreamStatus] = useState('')
   const messagesEndRef = useRef(null)
   const requestAbortRef = useRef(null)
   const fileInputRef = useRef(null)
@@ -203,6 +204,7 @@ function App() {
     setAttachmentError('')
     setError('')
     setSpeechError('')
+    setStreamStatus('')
     setLoadingSteps(buildLoadingSteps(trimmedInput))
     setLoading(true)
 
@@ -216,6 +218,9 @@ function App() {
       const result = await streamSolutionArchitectResponse({
         messages: nextMessages,
         signal: abortController.signal,
+        onStatus: (status) => {
+          setStreamStatus(status || '')
+        },
         onChunk: (chunk) => {
           streamedContent += chunk
 
@@ -230,6 +235,29 @@ function App() {
                         ? {
                             ...message,
                             content: streamedContent,
+                            isStreaming: true,
+                          }
+                        : message,
+                    ),
+                  }
+                : chat,
+            ),
+          )
+        },
+        onReplace: (nextContent) => {
+          streamedContent = nextContent
+
+          setChats((current) =>
+            current.map((chat) =>
+              chat.id === activeChat.id
+                ? {
+                    ...chat,
+                    updatedAt: new Date().toISOString(),
+                    messages: chat.messages.map((message) =>
+                      message.id === assistantMessageId
+                        ? {
+                            ...message,
+                            content: nextContent,
                             isStreaming: true,
                           }
                         : message,
@@ -281,6 +309,7 @@ function App() {
       if (requestAbortRef.current === abortController) {
         requestAbortRef.current = null
       }
+      setStreamStatus('')
       setLoading(false)
     }
   }
@@ -304,6 +333,7 @@ function App() {
     setAttachmentError('')
     setError('')
     setSpeechError('')
+    setStreamStatus('')
     setLoading(false)
     setLoadingSteps([])
     setIsSidebarOpen(false)
@@ -339,6 +369,7 @@ function App() {
       setAttachmentError('')
       setError('')
       setSpeechError('')
+      setStreamStatus('')
       setLoading(false)
       setLoadingSteps([])
       setIsSidebarOpen(false)
@@ -511,11 +542,18 @@ function App() {
           }`}
         >
           <div className="h-full">
+            <div className="mb-4 px-1">
+              <p className="text-[15px] font-semibold tracking-tight text-slate-900">
+                Solution Architect GPT
+              </p>
+            </div>
+
             <button
               type="button"
               onClick={handleNewChat}
-              className={`mb-3 inline-flex w-full items-center justify-center rounded-2xl border px-4 py-3 text-sm font-medium transition ${ACCENT_SURFACE_CLASS} ${ACCENT_SURFACE_HOVER_CLASS}`}
+              className="mb-3 inline-flex items-center gap-2 px-1 py-2 text-[15px] font-medium text-slate-900 transition hover:text-slate-700"
             >
+              <ComposeIcon />
               New Chat
             </button>
 
@@ -526,16 +564,9 @@ function App() {
               <span className="text-xs text-slate-400">{chats.length}</span>
             </div>
 
-            <div className="flex flex-col gap-2 overflow-y-auto overflow-x-hidden pb-1 md:max-h-[calc(100vh-110px)]">
+            <div className="flex flex-col gap-0.5 overflow-y-auto overflow-x-hidden pb-1 md:max-h-[calc(100vh-110px)]">
               {chats.map((chat) => (
-                <div
-                  key={chat.id}
-                  className={`group relative rounded-xl border transition ${
-                    chat.id === activeChatId
-                      ? `${ACCENT_SURFACE_CLASS}`
-                      : 'border-slate-200 bg-white text-slate-700 hover:border-slate-300'
-                  }`}
-                >
+                <div key={chat.id} className="group relative">
                   <button
                     type="button"
                     onClick={() => {
@@ -543,9 +574,13 @@ function App() {
                       setError('')
                       setIsSidebarOpen(false)
                     }}
-                    className="w-full rounded-xl px-3 py-2.5 pr-9 text-left"
+                    className={`w-full rounded-lg px-1 py-2 pr-8 text-left text-[14px] transition ${
+                      chat.id === activeChatId
+                        ? 'font-medium text-slate-900'
+                        : 'text-slate-600 hover:text-slate-900'
+                    }`}
                   >
-                    <p className="truncate text-[13px] font-medium">{chat.title}</p>
+                    <p className="truncate">{chat.title}</p>
                   </button>
 
                   <button
@@ -556,7 +591,7 @@ function App() {
                     }}
                     className={`absolute right-2 top-2 inline-flex h-6 w-6 items-center justify-center rounded-full transition ${
                       chat.id === activeChatId
-                        ? 'text-slate-500 opacity-0 hover:bg-white/60 hover:text-slate-700 group-hover:opacity-100'
+                        ? 'text-slate-500 opacity-0 hover:bg-slate-100 hover:text-slate-700 group-hover:opacity-100'
                         : 'text-slate-400 opacity-0 hover:bg-slate-100 hover:text-slate-700 group-hover:opacity-100'
                     }`}
                     aria-label="Delete chat"
@@ -608,7 +643,7 @@ function App() {
                       className={
                         message.role === 'user'
                           ? 'w-auto max-w-[92%] rounded-[20px] border border-[#cfe0f5] bg-[#edf5ff] px-4 py-3 text-[14px] leading-6 text-slate-800 shadow-[0_10px_24px_rgba(125,147,178,0.12)] sm:max-w-[85%] sm:rounded-[22px] sm:px-5 sm:py-3.5 md:max-w-[78%] lg:max-w-2xl'
-                          : 'w-full px-1 py-1 text-slate-700 sm:px-2 sm:py-2 lg:max-w-none'
+                          : 'w-full pr-2 px-1 py-1 text-slate-700 sm:px-2 sm:py-2 sm:pr-3 lg:pr-4 xl:pr-5'
                       }
                     >
                       {message.role === 'user' ? (
@@ -700,22 +735,20 @@ function App() {
                   </section>
                 ))}
 
-                {loading ? (
-                  <section className="flex justify-start">
-                    <div className="max-w-[92%] rounded-[18px] bg-white px-3.5 py-3 shadow-sm ring-1 ring-slate-200 sm:max-w-[85%] sm:rounded-[20px] sm:px-4">
-                      <div className="flex items-center gap-2.5 sm:gap-3">
-                        <div className="flex items-center gap-1.5">
-                          <span className="h-2 w-2 animate-bounce rounded-full bg-slate-400 [animation-delay:-0.3s]" />
-                          <span className="h-2 w-2 animate-bounce rounded-full bg-slate-400 [animation-delay:-0.15s]" />
-                          <span className="h-2 w-2 animate-bounce rounded-full bg-slate-400" />
-                        </div>
-                        <div className="min-w-0">
-                          <p className="text-[13px] font-medium leading-5 text-slate-700 sm:text-[14px]">
-                            {findStreamingMessage(messages)?.content
-                              ? 'Generating response live'
-                              : loadingSteps[loadingStepIndex] || 'Analyzing request'}
-                          </p>
-                        </div>
+                {loading && !findStreamingMessage(messages)?.content ? (
+                  <section className="flex justify-start px-1 py-1 sm:px-2">
+                    <div className="flex items-center gap-2.5 sm:gap-3">
+                      <div className="flex items-center gap-1.5">
+                        <span className="h-2 w-2 animate-bounce rounded-full bg-slate-400 [animation-delay:-0.3s]" />
+                        <span className="h-2 w-2 animate-bounce rounded-full bg-slate-400 [animation-delay:-0.15s]" />
+                        <span className="h-2 w-2 animate-bounce rounded-full bg-slate-400" />
+                      </div>
+                      <div className="min-w-0">
+                        <p className="text-[13px] font-medium leading-5 text-slate-600 sm:text-[14px]">
+                          {findStreamingMessage(messages)?.content
+                            ? streamStatus || 'Generating response live'
+                            : loadingSteps[loadingStepIndex] || 'Analyzing request'}
+                        </p>
                       </div>
                     </div>
                   </section>
@@ -840,6 +873,23 @@ function MobileHeader({ isSidebarOpen, onToggle }) {
         <MenuIcon />
       </button>
     </div>
+  )
+}
+
+function ComposeIcon() {
+  return (
+    <svg viewBox="0 0 24 24" fill="none" className="h-5 w-5" stroke="currentColor" strokeWidth="2">
+      <path
+        d="M12 20h9"
+        strokeLinecap="round"
+        strokeLinejoin="round"
+      />
+      <path
+        d="m16.5 3.5 4 4L8 20l-5 1 1-5 12.5-12.5Z"
+        strokeLinecap="round"
+        strokeLinejoin="round"
+      />
+    </svg>
   )
 }
 
@@ -1252,9 +1302,11 @@ function normalizeAssistantMarkdown(content) {
   return content
     .split('\n')
     .map((line) =>
-      cleanAssistantLine(
-        convertStandaloneBoldToHeading(
-          normalizeBrokenBoldSyntax(stripLeadingEmoji(line)),
+      removeSolutionLabelLine(
+        cleanAssistantLine(
+          convertStandaloneBoldToHeading(
+            normalizeBrokenBoldSyntax(stripLeadingEmoji(line)),
+          ),
         ),
       ),
     )
@@ -1348,6 +1400,12 @@ function stripBoldMarkers(line) {
     .replace(/^(\d+\.\s+)\*\*+\s*(.+?)\s*\*+$/g, '$1$2')
     .replace(/^>\s*\*\*+\s*(.+?)\s*\*+$/g, '> $1')
     .replace(/\*\*+\s*([^*]+?)\s*\*+/g, '$1')
+}
+
+function removeSolutionLabelLine(line) {
+  return /^\s*label\s*:\s*\[(?:predefined match|custom dynamic solution|combo)\].*$/i.test(line)
+    ? ''
+    : line
 }
 
 function isDividerLine(line) {

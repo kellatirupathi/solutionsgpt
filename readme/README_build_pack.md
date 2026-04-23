@@ -1,136 +1,65 @@
-# README_build_pack.md
-# Solution Architect GPT — Complete Build Pack Overview
+# Solution Architect GPT Build Pack
 
-## WHAT THIS GPT IS
+## Current Architecture
 
-Solution Architect GPT is a specialized AI consultant that analyzes any business use case and returns a complete, actionable solution recommendation — including the best-fit solution, tech stack, features, pricing, and a ready-to-sell offer.
+This application now uses a single master instruction file:
 
-It is designed for:
-- Freelance developers and agencies who want to sell digital solutions to local businesses
-- Business consultants who need to quickly assess and recommend tech solutions
-- Entrepreneurs who want to build solution-selling businesses
+- `SolutionArchitectGPT_Instructions_7900.md`
 
----
+That file is the only runtime prompt and knowledge document used by the app.
 
-## HOW THIS GPT SYSTEM IS STRUCTURED
+The application still keeps small planning heuristics in code:
+- `src/lib/knowledgeBase.js` decides clarify mode vs analysis mode
+- `src/lib/knowledgeBase.js` decides which response sections are required
+- `src/lib/openai.js` handles provider calls, streaming, validation, and fallback behavior
 
-### Layer 1: Instructions (Pasted in CustomGPT)
-The master operating rules. Defines identity, decision logic, response format, and quality rules.
-→ File: `SolutionArchitectGPT_CompleteInstructions.md`
+## Active Prompt Flow
 
-### Layer 2: Knowledge Files (Uploaded to CustomGPT)
-7 reference files that give the GPT deep domain knowledge:
+1. User enters the business problem
+2. The app checks whether the input is clear enough for full analysis
+3. The app builds a response plan in code
+4. The app sends the user input, the response plan context, and the single master instruction file to the selected model
+5. The model returns either clarifying questions or the structured business solution response
 
-| File | Purpose |
-|---|---|
-| `industry-usecases.md` | Business type profiles + common pain points |
-| `solution-categories.md` | Detailed breakdown of every solution type |
-| `solution-mapping-rules.md` | Decision logic for matching pain to solution |
-| `builder-instructions.md` | Tech stack, tools, build complexity guide |
-| `offer-packaging.md` | Pricing tiers, ROI pitches, upsell menu |
-| `sample-outputs.md` | Gold standard example responses |
-| `README_build_pack.md` | This file — system overview |
+## Why This Changed
 
----
+The old setup used multiple markdown knowledge files:
+- harder to maintain
+- more prompt assembly complexity
+- more ambiguity about which file was authoritative
+- larger runtime context
 
-## HOW TO SET UP YOUR CUSTOMGPT
+The new setup keeps one maintained source of truth and reduces prompt-management overhead.
 
-### Step 1: Go to ChatGPT → Explore GPTs → Create
-### Step 2: Click "Configure" tab
-### Step 3: Fill in:
+## Legacy Prompt Pack
 
-**Name:** Solution Architect GPT
+The previous multi-file prompt pack is archived here:
 
-**Description:**
-> Analyzes any business use case and recommends the best-fit digital solution — CRM, automation, WhatsApp bot, loyalty system, or custom build — based on the actual problem and revenue opportunity. Not just "build a website."
+- `readme/archive/legacy-prompt-pack/`
 
-**Instructions:**
-→ Paste entire content of `SolutionArchitectGPT_CompleteInstructions.md`
+Those files are kept only for historical reference. They are not part of the active runtime prompt path anymore.
 
-**Conversation Starters:**
-1. Give me the best solution for a gym losing members and collecting fees late
-2. A clinic has too many missed appointments — what should we build?
-3. I run a salon and repeat customers are dropping — what solution fixes this?
-4. Analyze this business and give me a monetizable solution I can sell
-5. A kirana shop wants to track credit customers — what's the best approach?
+Archived files:
+- `builder-instructions.md`
+- `client-cost-breakdown.md`
+- `industry-usecases.md`
+- `offer-packaging.md`
+- `offer-packaging (1).md`
+- `sample-outputs.md`
+- `solution-categories.md`
+- `solution-mapping-rules.md`
+- `tool-pricing-guide.md`
 
-**Knowledge Files:**
-→ Upload all 6 files: industry-usecases.md, solution-categories.md, solution-mapping-rules.md, builder-instructions.md, offer-packaging.md, sample-outputs.md
+## Maintenance Rule
 
-**Capabilities:**
-✅ Web Search — ON (for looking up latest tool pricing)
-✅ Code Interpreter — ON (for generating implementation snippets)
-✅ Image Generation — Optional
+If you want to improve solution quality, update the master file first:
 
-**Model:** GPT-4o (select in Model dropdown)
+- `readme/SolutionArchitectGPT_Instructions_7900.md`
 
----
+Only change code when the behavior itself must change, such as:
+- response section selection
+- clarify-mode thresholds
+- provider behavior
+- validation and fallback rules
 
-## HOW THE GPT DECIDES
-
-```
-User Input
-    ↓
-Identify Business Type (from industry-usecases.md)
-    ↓
-Identify Primary Pain Point
-    ↓
-Match to Solution (from solution-mapping-rules.md)
-    ↓
-Is it a predefined match? 
-    YES → Pick from solution-categories.md
-    NO  → Think dynamically → Propose custom solution
-    ↓
-Build recommendation using builder-instructions.md
-    ↓
-Package the offer using offer-packaging.md
-    ↓
-Format response per instructions template
-    ↓
-End with follow-up suggestions (A/B/C/D)
-```
-
----
-
-## QUALITY STANDARD
-
-Every response must:
-- Be specific to the business described (not generic)
-- Include real tool names and real pricing
-- Include a complete offer with setup fee + monthly retainer
-- Include ROI framing for the client
-- End with 4 follow-up suggestion options (A/B/C/D)
-- Match the depth of sample-outputs.md examples
-
----
-
-## WHAT MAKES THIS GPT DIFFERENT FROM GENERIC CHATGPT
-
-| Generic ChatGPT | Solution Architect GPT |
-|---|---|
-| "You should build a website" | "A website won't solve your payment problem — here's what will" |
-| Vague tool suggestions | Specific tools with pricing and why |
-| No monetization guidance | Complete offer with setup fee + MRR |
-| Generic response format | Consistent 12-section structured analysis |
-| No follow-up path | Always offers 4 next-step options |
-| No business-type knowledge | Deep profiles for 12+ business types |
-
----
-
-## MAINTENANCE GUIDE
-
-**When to update knowledge files:**
-- When new tools become better alternatives (e.g., a new WhatsApp API provider)
-- When pricing changes significantly
-- When new business types need to be added
-- When new solution categories emerge
-
-**How to update:**
-- Edit the relevant .md file
-- Delete old version from CustomGPT knowledge
-- Upload new version
-- Click Update
-
----
-
-*This build pack gives you a production-ready, professional-grade CustomGPT that can be used as a real consulting tool or sold as a service.*
+This keeps instruction maintenance and application logic cleanly separated.
