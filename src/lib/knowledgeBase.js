@@ -33,7 +33,9 @@ Execution requirements:
 - Use the markdown knowledge files below as the authoritative reference set.
 - Base every answer on the decision logic, response format, pricing logic, quality rules, tool choices, and sample standards contained in these files.
 - Preserve the exact response structure requested by the instruction set.
-- Keep icon usage minimal in the final answer. Prefer plain text section headings and avoid excessive emojis.
+- Do not use emojis, icons, or decorative symbols in the final answer.
+- Use headings, subheadings, bold text, bullet lists, numbered lists, tables, and code blocks wherever they improve clarity.
+- Prefer clean, readable markdown formatting for the final answer.
 - Always include pricing in INR.
 - Always include the A/B/C/D follow-up options.
 - If the user input is vague, ask 2-3 clarifying questions before doing full analysis.

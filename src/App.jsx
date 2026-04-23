@@ -581,65 +581,320 @@ function getChatIdFromPath() {
 
 function buildLoadingSteps(input) {
   const normalizedInput = input.toLowerCase()
-  const businessType = detectBusinessType(normalizedInput)
-  const painLabel = detectPainLabel(normalizedInput)
-
-  const subject = businessType ? `${businessType} business` : 'business context'
+  const analysisContext = resolveAnalysisContext(normalizedInput)
+  const businessLabel = analysisContext.businessLabel || 'business context'
+  const painLabel = analysisContext.painLabel
+  const solutionLabel = analysisContext.solutionLabel
 
   return [
-    `Reviewing ${subject}`,
+    `Reviewing ${businessLabel}`,
     painLabel ? `Investigating ${painLabel}` : 'Finding the real operational problem',
-    businessType ? `Matching the best solution for ${businessType}` : 'Matching the best-fit solution',
+    solutionLabel ? `Matching ${solutionLabel}` : 'Matching the best-fit solution',
     'Estimating tools, pricing, and offer packaging',
     'Preparing final recommendation',
   ]
 }
 
-function detectBusinessType(input) {
-  const businessPatterns = [
-    ['gym', 'gym'],
-    ['fitness', 'fitness center'],
-    ['clinic', 'clinic'],
-    ['doctor', 'clinic'],
-    ['salon', 'salon'],
-    ['spa', 'salon'],
-    ['coaching', 'coaching center'],
-    ['tuition', 'coaching center'],
-    ['kirana', 'kirana shop'],
-    ['retail', 'retail shop'],
-    ['restaurant', 'restaurant'],
-    ['cafe', 'restaurant'],
-    ['real estate', 'real estate agency'],
-    ['property', 'real estate agency'],
-    ['agency', 'digital agency'],
-    ['freelancer', 'freelancer business'],
-    ['contractor', 'contractor business'],
-    ['construction', 'construction business'],
-    ['photographer', 'photography business'],
-    ['workshop', 'auto workshop'],
-    ['garage', 'auto workshop'],
-    ['logistics', 'logistics business'],
-    ['delivery', 'delivery business'],
-  ]
+function resolveAnalysisContext(input) {
+  const businessMatch = businessProfiles.find((profile) =>
+    profile.patterns.some((pattern) => input.includes(pattern)),
+  )
 
-  const match = businessPatterns.find(([pattern]) => input.includes(pattern))
-  return match?.[1] || ''
+  const painMatch =
+    businessMatch?.painProfiles.find((profile) =>
+      profile.patterns.some((pattern) => input.includes(pattern)),
+    ) ||
+    globalPainProfiles.find((profile) => profile.patterns.some((pattern) => input.includes(pattern)))
+
+  return {
+    businessType: businessMatch?.name || '',
+    businessLabel: businessMatch?.label || '',
+    painLabel: painMatch?.label || '',
+    solutionLabel:
+      painMatch?.solutionLabel || businessMatch?.defaultSolutionLabel || '',
+  }
+}
+
+const businessProfiles = [
+  {
+    name: 'gym',
+    label: 'gym membership and retention workflow',
+    patterns: ['gym', 'fitness'],
+    defaultSolutionLabel: 'member management and payment reminder system',
+    painProfiles: [
+      {
+        label: 'late renewals and payment collections',
+        patterns: ['payment', 'late payment', 'renewal', 'renewals', 'due', 'dues', 'collection'],
+        solutionLabel: 'member management and automated payment reminders',
+      },
+      {
+        label: 'member attendance tracking',
+        patterns: ['attendance', 'checkin', 'check-in', 'entry', 'visit'],
+        solutionLabel: 'attendance tracking and member management',
+      },
+      {
+        label: 'trial lead conversion',
+        patterns: ['lead', 'trial', 'conversion', 'pipeline'],
+        solutionLabel: 'lead CRM and follow-up automation',
+      },
+    ],
+  },
+  {
+    name: 'clinic',
+    label: 'clinic appointments and patient follow-up flow',
+    patterns: ['clinic', 'doctor', 'hospital', 'patient'],
+    defaultSolutionLabel: 'appointment booking and patient reminder system',
+    painProfiles: [
+      {
+        label: 'appointments, no-shows, and patient follow-up',
+        patterns: ['appointment', 'booking', 'no-show', 'follow-up', 'missed'],
+        solutionLabel: 'appointment booking, reminders, and patient CRM',
+      },
+      {
+        label: 'WhatsApp and receptionist workload',
+        patterns: ['whatsapp', 'messages', 'receptionist', 'support'],
+        solutionLabel: 'WhatsApp automation and patient intake workflow',
+      },
+    ],
+  },
+  {
+    name: 'salon',
+    label: 'salon repeat-customer and booking journey',
+    patterns: ['salon', 'spa', 'beauty'],
+    defaultSolutionLabel: 'loyalty and customer follow-up system',
+    painProfiles: [
+      {
+        label: 'repeat customer retention',
+        patterns: ['retention', 'repeat customer', 'repeat', 'churn', 'return', 'disappear'],
+        solutionLabel: 'loyalty, rewards, and follow-up automation',
+      },
+      {
+        label: 'appointments and missed bookings',
+        patterns: ['appointment', 'booking', 'schedule', 'no-show'],
+        solutionLabel: 'booking workflow and reminder automation',
+      },
+    ],
+  },
+  {
+    name: 'coaching center',
+    label: 'student fees, attendance, and admissions workflow',
+    patterns: ['coaching', 'tuition', 'institute', 'students', 'student'],
+    defaultSolutionLabel: 'fee reminder and attendance management system',
+    painProfiles: [
+      {
+        label: 'fee collection delays',
+        patterns: ['fees', 'fee', 'payment', 'dues', 'collection'],
+        solutionLabel: 'fee reminder and payment tracking system',
+      },
+      {
+        label: 'student attendance tracking',
+        patterns: ['attendance', 'absent', 'class attendance'],
+        solutionLabel: 'attendance tracking and reporting workflow',
+      },
+      {
+        label: 'lead follow-up for admissions',
+        patterns: ['lead', 'enquiry', 'admission', 'conversion'],
+        solutionLabel: 'lead CRM and admissions follow-up',
+      },
+    ],
+  },
+  {
+    name: 'kirana shop',
+    label: 'kirana credit, collections, and inventory flow',
+    patterns: ['kirana', 'grocery', 'retail', 'shop'],
+    defaultSolutionLabel: 'credit tracking and inventory management system',
+    painProfiles: [
+      {
+        label: 'credit dues and payment follow-up',
+        patterns: ['credit', 'due', 'dues', 'collection', 'payment'],
+        solutionLabel: 'credit tracking and payment reminder workflow',
+      },
+      {
+        label: 'inventory tracking',
+        patterns: ['inventory', 'stock', 'stockout', 'stock out'],
+        solutionLabel: 'inventory monitoring and reorder workflow',
+      },
+      {
+        label: 'customer retention',
+        patterns: ['retention', 'repeat customer', 'loyalty'],
+        solutionLabel: 'simple loyalty and customer follow-up system',
+      },
+    ],
+  },
+  {
+    name: 'restaurant',
+    label: 'restaurant orders and repeat-customer workflow',
+    patterns: ['restaurant', 'cafe', 'food', 'dine-in', 'takeaway'],
+    defaultSolutionLabel: 'WhatsApp ordering and loyalty system',
+    painProfiles: [
+      {
+        label: 'repeat customer engagement',
+        patterns: ['retention', 'repeat customer', 'loyalty'],
+        solutionLabel: 'loyalty and customer follow-up automation',
+      },
+      {
+        label: 'WhatsApp ordering and order handling',
+        patterns: ['whatsapp', 'order', 'ordering', 'delivery'],
+        solutionLabel: 'WhatsApp ordering and operations workflow',
+      },
+    ],
+  },
+  {
+    name: 'real estate agency',
+    label: 'real estate lead and follow-up pipeline',
+    patterns: ['real estate', 'property', 'broker', 'brokerage'],
+    defaultSolutionLabel: 'CRM and lead pipeline automation',
+    painProfiles: [
+      {
+        label: 'lead leakage and poor follow-up',
+        patterns: ['lead', 'follow-up', 'pipeline', 'conversion'],
+        solutionLabel: 'lead CRM and follow-up automation',
+      },
+    ],
+  },
+  {
+    name: 'digital agency',
+    label: 'agency clients, billing, and delivery workflow',
+    patterns: ['agency', 'freelancer', 'client project'],
+    defaultSolutionLabel: 'client CRM and invoicing system',
+    painProfiles: [
+      {
+        label: 'invoice follow-up and collections',
+        patterns: ['invoice', 'billing', 'payment', 'collection'],
+        solutionLabel: 'billing automation and client payment tracking',
+      },
+      {
+        label: 'project and client coordination',
+        patterns: ['project', 'client', 'task', 'delivery'],
+        solutionLabel: 'client CRM and project tracker',
+      },
+    ],
+  },
+  {
+    name: 'contractor business',
+    label: 'contractor payments, milestones, and site operations',
+    patterns: ['contractor', 'construction', 'site', 'builder'],
+    defaultSolutionLabel: 'milestone tracking and payment workflow',
+    painProfiles: [
+      {
+        label: 'milestone billing and collections',
+        patterns: ['payment', 'milestone', 'invoice', 'billing'],
+        solutionLabel: 'milestone tracker and payment reminders',
+      },
+      {
+        label: 'site attendance and progress tracking',
+        patterns: ['attendance', 'labour', 'labor', 'site progress'],
+        solutionLabel: 'site attendance and project tracking system',
+      },
+    ],
+  },
+  {
+    name: 'photography business',
+    label: 'client communication and delivery workflow',
+    patterns: ['photographer', 'photography', 'wedding photographer'],
+    defaultSolutionLabel: 'client portal and follow-up workflow',
+    painProfiles: [
+      {
+        label: 'scattered WhatsApp communication',
+        patterns: ['whatsapp', 'chaotic', 'messages', 'follow-up'],
+        solutionLabel: 'client portal and communication workflow',
+      },
+    ],
+  },
+  {
+    name: 'auto workshop',
+    label: 'service jobs and customer reminder workflow',
+    patterns: ['workshop', 'garage', 'mechanic', 'service center'],
+    defaultSolutionLabel: 'digital job card and service reminder system',
+    painProfiles: [
+      {
+        label: 'service reminder follow-up',
+        patterns: ['service reminder', 'follow-up', 'repeat service'],
+        solutionLabel: 'service reminder and customer CRM',
+      },
+      {
+        label: 'job card and service tracking',
+        patterns: ['job card', 'repair', 'vehicle', 'service'],
+        solutionLabel: 'digital job card and operations tracker',
+      },
+    ],
+  },
+  {
+    name: 'logistics business',
+    label: 'delivery tracking and proof-of-delivery workflow',
+    patterns: ['logistics', 'delivery', 'courier', 'dispatch'],
+    defaultSolutionLabel: 'delivery management and invoicing system',
+    painProfiles: [
+      {
+        label: 'delivery tracking and proof of delivery',
+        patterns: ['tracking', 'proof of delivery', 'pod', 'dispatch'],
+        solutionLabel: 'delivery tracking and proof-of-delivery workflow',
+      },
+      {
+        label: 'invoicing and collections',
+        patterns: ['invoice', 'billing', 'payment', 'collection'],
+        solutionLabel: 'invoicing and collection automation',
+      },
+    ],
+  },
+]
+
+const globalPainProfiles = [
+  {
+    label: 'payment collections',
+    patterns: ['payment', 'late payment', 'due', 'dues', 'collection', 'credit'],
+    solutionLabel: 'payment reminder and collection workflow',
+  },
+  {
+    label: 'customer retention',
+    patterns: ['retention', 'repeat customer', 'churn', 'renewal'],
+    solutionLabel: 'customer follow-up and retention system',
+  },
+  {
+    label: 'lead conversion',
+    patterns: ['lead', 'conversion', 'pipeline'],
+    solutionLabel: 'lead management and follow-up workflow',
+  },
+  {
+    label: 'appointments and no-shows',
+    patterns: ['appointment', 'booking', 'no-show'],
+    solutionLabel: 'appointment reminders and booking workflow',
+  },
+  {
+    label: 'inventory tracking',
+    patterns: ['inventory', 'stock'],
+    solutionLabel: 'inventory management workflow',
+  },
+  {
+    label: 'attendance tracking',
+    patterns: ['attendance', 'staff attendance'],
+    solutionLabel: 'attendance tracking workflow',
+  },
+  {
+    label: 'WhatsApp workload',
+    patterns: ['whatsapp', 'messages', 'support'],
+    solutionLabel: 'WhatsApp automation workflow',
+  },
+  {
+    label: 'billing operations',
+    patterns: ['billing', 'invoice'],
+    solutionLabel: 'billing and invoicing workflow',
+  },
+]
+
+function detectBusinessType(input) {
+  const analysisContext = resolveAnalysisContext(input)
+  return analysisContext.businessType
 }
 
 function detectPainLabel(input) {
-  const painPatterns = [
-    [['payment', 'late payment', 'due', 'dues', 'collection', 'credit'], 'payment collections'],
-    [['retention', 'repeat customer', 'churn', 'renewal'], 'customer retention'],
-    [['lead', 'conversion', 'pipeline'], 'lead conversion'],
-    [['appointment', 'booking', 'no-show'], 'appointments and no-shows'],
-    [['inventory', 'stock'], 'inventory tracking'],
-    [['attendance', 'staff attendance'], 'attendance tracking'],
-    [['whatsapp', 'messages', 'support'], 'WhatsApp workload'],
-    [['billing', 'invoice'], 'billing operations'],
-  ]
+  const analysisContext = resolveAnalysisContext(input)
+  return analysisContext.painLabel
+}
 
-  const match = painPatterns.find(([patterns]) => patterns.some((pattern) => input.includes(pattern)))
-  return match?.[1] || ''
+function detectSolutionLabel(input) {
+  const analysisContext = resolveAnalysisContext(input)
+  return analysisContext.solutionLabel
 }
 
 function normalizeAssistantMarkdown(content) {
@@ -649,7 +904,7 @@ function normalizeAssistantMarkdown(content) {
 
   return content
     .split('\n')
-    .map((line) => stripLeadingEmoji(line))
+    .map((line) => convertStandaloneBoldToHeading(stripLeadingEmoji(line)))
     .join('\n')
 }
 
@@ -658,6 +913,17 @@ function stripLeadingEmoji(line) {
     /^(\s*(?:[-*]\s+)?)(?:[\p{Extended_Pictographic}\uFE0F\u200D]+(?:\s+|$))+?/u,
     '$1',
   )
+}
+
+function convertStandaloneBoldToHeading(line) {
+  const trimmed = line.trim()
+  const match = trimmed.match(/^\*\*(.+?)\*\*$/)
+
+  if (!match) {
+    return line
+  }
+
+  return `## ${match[1].trim()}`
 }
 
 export default App
