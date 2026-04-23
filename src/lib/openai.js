@@ -12,7 +12,7 @@ const openAiModel = import.meta.env.VITE_OPENAI_MODEL || 'gpt-4.1'
 const groqModel = import.meta.env.VITE_GROQ_MODEL || 'openai/gpt-oss-120b'
 const mistralModel = import.meta.env.VITE_MISTRAL_MODEL || 'mistral-large-2512'
 
-export async function generateSolutionArchitectResponse({ businessInput }) {
+export async function generateSolutionArchitectResponse({ messages }) {
   const providerChain = buildProviderChain()
 
   if (providerChain.length === 0) {
@@ -26,14 +26,14 @@ export async function generateSolutionArchitectResponse({ businessInput }) {
   for (const provider of providerChain) {
     try {
       if (provider === 'mistral') {
-        return await fetchFromMistral({ businessInput })
+        return await fetchFromMistral({ messages })
       }
 
       if (provider === 'groq') {
-        return await fetchFromGroq({ businessInput })
+        return await fetchFromGroq({ messages })
       }
 
-      return await fetchFromOpenAI({ businessInput })
+      return await fetchFromOpenAI({ messages })
     } catch (error) {
       lastError = error
     }
@@ -64,7 +64,7 @@ function buildProviderChain() {
   return [preferredProvider, ...availableProviders.filter((provider) => provider !== preferredProvider)]
 }
 
-async function fetchFromOpenAI({ businessInput }) {
+async function fetchFromOpenAI({ messages }) {
   const response = await fetch(OPENAI_API_URL, {
     method: 'POST',
     headers: {
@@ -74,24 +74,8 @@ async function fetchFromOpenAI({ businessInput }) {
     body: JSON.stringify({
       model: openAiModel,
       input: [
-        {
-          role: 'system',
-          content: [
-            {
-              type: 'input_text',
-              text: systemPrompt,
-            },
-          ],
-        },
-        {
-          role: 'user',
-          content: [
-            {
-              type: 'input_text',
-              text: businessInput,
-            },
-          ],
-        },
+        buildOpenAISystemMessage(),
+        ...buildOpenAIConversation(messages),
       ],
       temperature: 0.7,
     }),
@@ -114,7 +98,7 @@ async function fetchFromOpenAI({ businessInput }) {
   return outputText
 }
 
-async function fetchFromGroq({ businessInput }) {
+async function fetchFromGroq({ messages }) {
   const response = await fetch(GROQ_API_URL, {
     method: 'POST',
     headers: {
@@ -129,10 +113,7 @@ async function fetchFromGroq({ businessInput }) {
           role: 'system',
           content: systemPrompt,
         },
-        {
-          role: 'user',
-          content: businessInput,
-        },
+        ...buildChatConversation(messages),
       ],
     }),
   })
@@ -158,7 +139,7 @@ async function fetchFromGroq({ businessInput }) {
   return outputText
 }
 
-async function fetchFromMistral({ businessInput }) {
+async function fetchFromMistral({ messages }) {
   const response = await fetch(MISTRAL_API_URL, {
     method: 'POST',
     headers: {
@@ -173,10 +154,7 @@ async function fetchFromMistral({ businessInput }) {
           role: 'system',
           content: systemPrompt,
         },
-        {
-          role: 'user',
-          content: businessInput,
-        },
+        ...buildChatConversation(messages),
       ],
     }),
   })
@@ -231,4 +209,39 @@ function extractChatCompletionText(data) {
       .filter(Boolean)
       .join('\n') || ''
   )
+}
+
+function buildOpenAISystemMessage() {
+  return {
+    role: 'system',
+    content: [
+      {
+        type: 'input_text',
+        text: systemPrompt,
+      },
+    ],
+  }
+}
+
+function buildOpenAIConversation(messages = []) {
+  return messages
+    .filter((message) => message?.role === 'user' || message?.role === 'assistant')
+    .map((message) => ({
+      role: message.role,
+      content: [
+        {
+          type: 'input_text',
+          text: message.content,
+        },
+      ],
+    }))
+}
+
+function buildChatConversation(messages = []) {
+  return messages
+    .filter((message) => message?.role === 'user' || message?.role === 'assistant')
+    .map((message) => ({
+      role: message.role,
+      content: message.content,
+    }))
 }
