@@ -6,18 +6,22 @@ import * as pdfjsLib from 'pdfjs-dist'
 import pdfWorker from 'pdfjs-dist/build/pdf.worker.min.mjs?url'
 import * as XLSX from 'xlsx'
 import { streamSolutionArchitectResponse } from './lib/openai'
+import { RealtimeVoiceSession } from './lib/realtimeVoice'
+import { buildVoiceInstructions } from './lib/knowledgeBase'
+
+const OPENAI_REALTIME_API_KEY = import.meta.env.VITE_OPENAI_API_KEY
+const OPENAI_REALTIME_MODEL =
+  import.meta.env.VITE_OPENAI_REALTIME_MODEL || 'gpt-realtime'
+const OPENAI_REALTIME_VOICE = import.meta.env.VITE_OPENAI_REALTIME_VOICE || 'alloy'
+const VOICE_PRIOR_MESSAGE_LIMIT = 10
 
 const STORAGE_KEY = 'solution-architect-gpt-chats'
 const MAX_ATTACHMENT_CHARS = 12000
 const MAX_TOTAL_ATTACHMENT_CHARS = 24000
-const ACCENT_SURFACE_CLASS =
-  'border-[#cfe0f5] bg-[#edf5ff] text-slate-800 shadow-[0_12px_30px_rgba(125,147,178,0.14)]'
-const ACCENT_SURFACE_HOVER_CLASS =
-  'hover:border-[#bfd5ee] hover:bg-[#e4f0ff]'
 const ACCENT_INPUT_SURFACE_CLASS =
-  'border-[#cfe0f5] bg-[#f2f8ff] shadow-[0_18px_42px_rgba(125,147,178,0.16)] ring-1 ring-white/80'
+  'border-slate-200/80 bg-white shadow-[0_8px_30px_rgba(15,23,42,0.06)] ring-1 ring-black/5'
 const ACCENT_ICON_BUTTON_CLASS =
-  'bg-white text-slate-500 shadow-sm ring-1 ring-[#cfe0f5] transition hover:bg-[#e8f2ff] hover:text-slate-700'
+  'bg-transparent text-slate-500 transition hover:bg-slate-100 hover:text-slate-700'
 const conversationStarters = [
   'Suggest the right solution for gyms to track paid members and daily attendance',
   'Use Case: Salon Problem: losing repeat customers after first visit',
@@ -41,6 +45,10 @@ function App() {
   const [speechSupported, setSpeechSupported] = useState(false)
   const [speechError, setSpeechError] = useState('')
   const [streamStatus, setStreamStatus] = useState('')
+  const [isVoiceModeOpen, setIsVoiceModeOpen] = useState(false)
+  const [voiceState, setVoiceState] = useState('idle')
+  const [voiceError, setVoiceError] = useState('')
+  const [isVoiceMuted, setIsVoiceMuted] = useState(false)
   const messagesEndRef = useRef(null)
   const requestAbortRef = useRef(null)
   const fileInputRef = useRef(null)
@@ -49,6 +57,11 @@ function App() {
   const speechFinalTranscriptRef = useRef('')
   const speechShouldContinueRef = useRef(false)
   const uploadedFileIdsRef = useRef([])
+  const voiceSessionRef = useRef(null)
+  const voiceAssistantMessageIdRef = useRef(null)
+  const voiceChatIdRef = useRef(null)
+  const voicePendingUserMessageIdRef = useRef(null)
+  const voiceCurrentTurnHasUserMessageRef = useRef(false)
 
   pdfjsLib.GlobalWorkerOptions.workerSrc = pdfWorker
 
@@ -61,11 +74,13 @@ function App() {
 
   const renderedMessages = useMemo(
     () =>
-      messages.map((message) =>
-        message.role === 'assistant'
-          ? { ...message, content: normalizeAssistantMarkdown(message.content) }
-          : message,
-      ),
+      messages
+        .filter((message) => message.role !== 'user' || message.content)
+        .map((message) =>
+          message.role === 'assistant'
+            ? { ...message, content: normalizeAssistantMarkdown(message.content) }
+            : message,
+        ),
     [messages],
   )
 
@@ -153,6 +168,8 @@ function App() {
     requestAbortRef.current?.abort()
     speechShouldContinueRef.current = false
     speechRecognitionRef.current?.stop()
+    voiceSessionRef.current?.stop()
+    voiceSessionRef.current = null
   }, [])
 
   async function handleAnalyze(overrideInput) {
@@ -522,118 +539,441 @@ function App() {
     setIsListening(false)
   }
 
+  function appendVoiceUserTurn(transcript) {
+    const chatId = voiceChatIdRef.current
+    if (!chatId) return
+
+    voiceCurrentTurnHasUserMessageRef.current = true
+
+    const pendingId = voicePendingUserMessageIdRef.current
+    if (pendingId) {
+      // Fill in the placeholder that was inserted before transcription arrived
+      voicePendingUserMessageIdRef.current = null
+      setChats((current) =>
+        current.map((chat) =>
+          chat.id === chatId
+            ? {
+                ...chat,
+                title: chat.title === 'Voice chat' ? buildChatTitle(transcript) : chat.title,
+                updatedAt: new Date().toISOString(),
+                messages: chat.messages.map((message) =>
+                  message.id === pendingId ? { ...message, content: transcript } : message,
+                ),
+              }
+            : chat,
+        ),
+      )
+      return
+    }
+
+    // Transcription arrived before assistant deltas — safe to append directly
+    const userMessage = {
+      id: crypto.randomUUID(),
+      role: 'user',
+      content: transcript,
+      createdAt: new Date().toISOString(),
+    }
+
+    setChats((current) =>
+      current.map((chat) =>
+        chat.id === chatId
+          ? {
+              ...chat,
+              title: chat.title === 'Voice chat' ? buildChatTitle(transcript) : chat.title,
+              updatedAt: new Date().toISOString(),
+              messages: [...chat.messages, userMessage],
+            }
+          : chat,
+      ),
+    )
+  }
+
+  function applyVoiceAssistantDelta(_delta, fullTranscript) {
+    const chatId = voiceChatIdRef.current
+    if (!chatId) return
+
+    let assistantId = voiceAssistantMessageIdRef.current
+
+    if (!assistantId) {
+      assistantId = crypto.randomUUID()
+      voiceAssistantMessageIdRef.current = assistantId
+
+      const assistantMessage = {
+        id: assistantId,
+        role: 'assistant',
+        content: fullTranscript,
+        createdAt: new Date().toISOString(),
+        isStreaming: true,
+      }
+
+      if (!voiceCurrentTurnHasUserMessageRef.current) {
+        // Transcription hasn't arrived yet — insert an empty user placeholder
+        // BEFORE the assistant message so the chat stays in chronological order.
+        const placeholderId = crypto.randomUUID()
+        voicePendingUserMessageIdRef.current = placeholderId
+
+        const placeholder = {
+          id: placeholderId,
+          role: 'user',
+          content: '',
+          createdAt: new Date().toISOString(),
+        }
+
+        setChats((current) =>
+          current.map((chat) =>
+            chat.id === chatId
+              ? {
+                  ...chat,
+                  updatedAt: new Date().toISOString(),
+                  messages: [...chat.messages, placeholder, assistantMessage],
+                }
+              : chat,
+          ),
+        )
+      } else {
+        // Transcription already in chat — just append assistant message
+        setChats((current) =>
+          current.map((chat) =>
+            chat.id === chatId
+              ? {
+                  ...chat,
+                  updatedAt: new Date().toISOString(),
+                  messages: [...chat.messages, assistantMessage],
+                }
+              : chat,
+          ),
+        )
+      }
+      return
+    }
+
+    setChats((current) =>
+      current.map((chat) =>
+        chat.id === chatId
+          ? {
+              ...chat,
+              updatedAt: new Date().toISOString(),
+              messages: chat.messages.map((message) =>
+                message.id === assistantId
+                  ? { ...message, content: fullTranscript, isStreaming: true }
+                  : message,
+              ),
+            }
+          : chat,
+      ),
+    )
+  }
+
+  function finalizeVoiceAssistantTurn(finalTranscript) {
+    const chatId = voiceChatIdRef.current
+    const assistantId = voiceAssistantMessageIdRef.current
+
+    if (!chatId) {
+      return
+    }
+
+    if (!assistantId) {
+      const assistantMessage = {
+        id: crypto.randomUUID(),
+        role: 'assistant',
+        content: finalTranscript,
+        createdAt: new Date().toISOString(),
+        isStreaming: false,
+      }
+
+      setChats((current) =>
+        current.map((chat) =>
+          chat.id === chatId
+            ? {
+                ...chat,
+                updatedAt: new Date().toISOString(),
+                messages: [...chat.messages, assistantMessage],
+              }
+            : chat,
+        ),
+      )
+      return
+    }
+
+    setChats((current) =>
+      current.map((chat) =>
+        chat.id === chatId
+          ? {
+              ...chat,
+              updatedAt: new Date().toISOString(),
+              messages: chat.messages.map((message) =>
+                message.id === assistantId
+                  ? { ...message, content: finalTranscript, isStreaming: false }
+                  : message,
+              ),
+            }
+          : chat,
+      ),
+    )
+
+    voiceAssistantMessageIdRef.current = null
+  }
+
+  async function handleOpenVoiceMode() {
+    if (isVoiceModeOpen) {
+      return
+    }
+
+    if (!OPENAI_REALTIME_API_KEY) {
+      setVoiceError(
+        'Voice mode needs an OpenAI API key. Set VITE_OPENAI_API_KEY in your .env file and restart the dev server.',
+      )
+      setIsVoiceModeOpen(true)
+      setVoiceState('error')
+      return
+    }
+
+    requestAbortRef.current?.abort()
+    stopSpeechRecognition()
+
+    let chatForVoice = activeChat
+
+    if (!chatForVoice) {
+      chatForVoice = createNewChat()
+      setChats((current) => [chatForVoice, ...current])
+      setActiveChatId(chatForVoice.id)
+    }
+
+    const isEmptyChat = (chatForVoice.messages || []).length === 0
+    if (isEmptyChat) {
+      setChats((current) =>
+        current.map((chat) =>
+          chat.id === chatForVoice.id
+            ? { ...chat, title: 'Voice chat', updatedAt: new Date().toISOString() }
+            : chat,
+        ),
+      )
+    }
+
+    voiceChatIdRef.current = chatForVoice.id
+    voiceAssistantMessageIdRef.current = null
+    voicePendingUserMessageIdRef.current = null
+    voiceCurrentTurnHasUserMessageRef.current = false
+
+    setVoiceError('')
+    setVoiceState('connecting')
+    setIsVoiceModeOpen(true)
+
+    const priorMessages = (chatForVoice.messages || [])
+      .filter((message) => message.role === 'user' || message.role === 'assistant')
+      .filter((message) => message.content?.trim())
+      .slice(-VOICE_PRIOR_MESSAGE_LIMIT)
+      .map((message) => ({ role: message.role, content: message.content }))
+
+    const session = new RealtimeVoiceSession({
+      apiKey: OPENAI_REALTIME_API_KEY,
+      model: OPENAI_REALTIME_MODEL,
+      voice: OPENAI_REALTIME_VOICE,
+      instructions: buildVoiceInstructions(),
+      priorMessages,
+      onUserTranscript: (transcript) => {
+        appendVoiceUserTurn(transcript)
+      },
+      onAssistantDelta: (delta, fullTranscript) => {
+        applyVoiceAssistantDelta(delta, fullTranscript)
+      },
+      onAssistantDone: (finalTranscript) => {
+        finalizeVoiceAssistantTurn(finalTranscript)
+      },
+      onStateChange: (nextState) => {
+        if (nextState === 'speaking') {
+          voiceCurrentTurnHasUserMessageRef.current = false
+        }
+        setVoiceState(nextState)
+      },
+      onError: (error) => {
+        setVoiceError(error?.message || 'Voice session failed.')
+        setVoiceState('error')
+      },
+    })
+
+    voiceSessionRef.current = session
+    await session.start()
+  }
+
+  function handleCloseVoiceMode() {
+    voiceSessionRef.current?.stop()
+    voiceSessionRef.current = null
+
+    // Drop any unfilled placeholder user message left over from a cancelled turn
+    const chatId = voiceChatIdRef.current
+    const pendingId = voicePendingUserMessageIdRef.current
+    if (chatId && pendingId) {
+      setChats((current) =>
+        current.map((chat) =>
+          chat.id === chatId
+            ? { ...chat, messages: chat.messages.filter((m) => m.id !== pendingId || m.content) }
+            : chat,
+        ),
+      )
+    }
+
+    voiceChatIdRef.current = null
+    voiceAssistantMessageIdRef.current = null
+    voicePendingUserMessageIdRef.current = null
+    voiceCurrentTurnHasUserMessageRef.current = false
+    setIsVoiceModeOpen(false)
+    setVoiceState('idle')
+    setVoiceError('')
+    setIsVoiceMuted(false)
+  }
+
+  function handleVoiceInterrupt() {
+    voiceSessionRef.current?.interrupt()
+  }
+
+  function handleToggleVoiceMute() {
+    setIsVoiceMuted((current) => {
+      const next = !current
+      voiceSessionRef.current?.setMuted(next)
+      return next
+    })
+  }
+
   return (
-    <div className="min-h-screen bg-[#f8fafc] text-slate-900">
+    <div className="min-h-screen bg-white text-slate-900">
       <main className="flex min-h-screen w-full flex-col md:flex-row">
-        <MobileHeader isSidebarOpen={isSidebarOpen} onToggle={() => setIsSidebarOpen((value) => !value)} />
+        <MobileHeader
+          isSidebarOpen={isSidebarOpen}
+          onToggle={() => setIsSidebarOpen((value) => !value)}
+          onNewChat={handleNewChat}
+        />
 
         {isSidebarOpen ? (
           <button
             type="button"
             aria-label="Close sidebar overlay"
             onClick={() => setIsSidebarOpen(false)}
-            className="fixed inset-0 z-30 bg-slate-900/20 md:hidden"
+            className="fixed inset-0 z-30 bg-slate-900/30 backdrop-blur-sm md:hidden"
           />
         ) : null}
 
         <aside
-          className={`fixed inset-y-0 left-0 z-40 w-[260px] border-r border-slate-200 bg-white px-3 py-3 shadow-xl transition-transform md:sticky md:top-0 md:h-screen md:z-auto md:w-[290px] md:flex-none md:translate-x-0 md:border-b-0 md:bg-white/80 md:px-4 md:py-4 md:shadow-none md:backdrop-blur ${
-            isSidebarOpen ? 'translate-x-0' : '-translate-x-full'
+          className={`fixed inset-y-0 left-0 z-40 flex w-[280px] flex-col border-r border-slate-200 bg-[#f9fafb] px-3 py-3 shadow-xl transition-transform md:sticky md:top-0 md:h-screen md:w-[260px] md:flex-none md:translate-x-0 md:shadow-none ${
+            isSidebarOpen ? 'translate-x-0' : '-translate-x-full md:translate-x-0'
           }`}
         >
-          <div className="h-full">
-            <div className="mb-4 px-1">
-              <p className="text-[15px] font-semibold tracking-tight text-slate-900">
-                Solution Architect GPT
+          <div className="flex h-full flex-col">
+            <div className="mb-3 flex items-center gap-2.5 px-2 pt-1">
+              <div className="flex h-8 w-8 items-center justify-center rounded-xl bg-gradient-to-br from-slate-900 to-slate-700 text-white shadow-sm">
+                <SparkIcon className="h-4 w-4" />
+              </div>
+              <p className="truncate text-[14px] font-semibold tracking-tight text-slate-900">
+                Solution Architect
               </p>
             </div>
 
             <button
               type="button"
               onClick={handleNewChat}
-              className="mb-3 inline-flex items-center gap-2 px-1 py-2 text-[15px] font-medium text-slate-900 transition hover:text-slate-700"
+              className="mb-5 inline-flex w-full items-center gap-2.5 rounded-lg border border-slate-200 bg-white px-3 py-2.5 text-[13.5px] font-medium text-slate-800 shadow-sm transition hover:bg-slate-50 hover:shadow"
             >
               <ComposeIcon />
-              New Chat
+              <span>New chat</span>
             </button>
 
-            <div className="mb-2 flex items-center justify-between px-1">
-              <h2 className="text-xs font-semibold uppercase tracking-[0.18em] text-slate-500">
-                History
+            <div className="mb-1.5 flex items-center justify-between px-2">
+              <h2 className="text-[11px] font-semibold uppercase tracking-[0.12em] text-slate-400">
+                Recent
               </h2>
-              <span className="text-xs text-slate-400">{chats.length}</span>
+              {chats.length > 0 ? (
+                <span className="text-[11px] text-slate-400">{chats.length}</span>
+              ) : null}
             </div>
 
-            <div className="flex flex-col gap-0.5 overflow-y-auto overflow-x-hidden pb-1 md:max-h-[calc(100vh-110px)]">
-              {chats.map((chat) => (
-                <div key={chat.id} className="group relative">
-                  <button
-                    type="button"
-                    onClick={() => {
-                      setActiveChatId(chat.id)
-                      setError('')
-                      setIsSidebarOpen(false)
-                    }}
-                    className={`w-full rounded-lg px-1 py-2 pr-8 text-left text-[14px] transition ${
-                      chat.id === activeChatId
-                        ? 'font-medium text-slate-900'
-                        : 'text-slate-600 hover:text-slate-900'
-                    }`}
-                  >
-                    <p className="truncate">{chat.title}</p>
-                  </button>
+            <div className="flex-1 overflow-y-auto overflow-x-hidden pb-2">
+              <div className="flex flex-col gap-0.5">
+                {chats.map((chat) => (
+                  <div key={chat.id} className="group relative">
+                    <button
+                      type="button"
+                      onClick={() => {
+                        setActiveChatId(chat.id)
+                        setError('')
+                        setIsSidebarOpen(false)
+                      }}
+                      className={`block w-full rounded-lg px-2.5 py-2 pr-9 text-left text-[13.5px] leading-5 transition ${
+                        chat.id === activeChatId
+                          ? 'bg-white font-medium text-slate-900 shadow-sm ring-1 ring-slate-200'
+                          : 'text-slate-600 hover:bg-slate-100 hover:text-slate-900'
+                      }`}
+                    >
+                      <p className="truncate">{chat.title}</p>
+                    </button>
 
-                  <button
-                    type="button"
-                    onClick={(event) => {
-                      event.stopPropagation()
-                      handleDeleteChat(chat.id)
-                    }}
-                    className={`absolute right-2 top-2 inline-flex h-6 w-6 items-center justify-center rounded-full transition ${
-                      chat.id === activeChatId
-                        ? 'text-slate-500 opacity-0 hover:bg-slate-100 hover:text-slate-700 group-hover:opacity-100'
-                        : 'text-slate-400 opacity-0 hover:bg-slate-100 hover:text-slate-700 group-hover:opacity-100'
-                    }`}
-                    aria-label="Delete chat"
-                  >
-                    <TrashIcon />
-                  </button>
+                    <button
+                      type="button"
+                      onClick={(event) => {
+                        event.stopPropagation()
+                        handleDeleteChat(chat.id)
+                      }}
+                      className="absolute right-1.5 top-1.5 inline-flex h-7 w-7 items-center justify-center rounded-md text-slate-400 opacity-0 transition hover:bg-slate-200/70 hover:text-slate-700 group-hover:opacity-100"
+                      aria-label="Delete chat"
+                    >
+                      <TrashIcon />
+                    </button>
+                  </div>
+                ))}
+              </div>
+            </div>
+
+            <div className="mt-2 border-t border-slate-200/70 pt-3">
+              <button
+                type="button"
+                className="flex w-full items-center gap-2.5 rounded-lg px-2 py-1.5 text-left transition hover:bg-slate-100"
+              >
+                <div className="flex h-7 w-7 items-center justify-center rounded-full bg-gradient-to-br from-indigo-500 to-purple-600 text-[10.5px] font-semibold uppercase text-white shadow-sm">
+                  SA
                 </div>
-              ))}
+                <div className="min-w-0 flex-1">
+                  <p className="truncate text-[12.5px] font-medium text-slate-700">
+                    Solution Architect
+                  </p>
+                </div>
+              </button>
             </div>
           </div>
         </aside>
 
         <section className="flex min-h-screen min-w-0 flex-1 flex-col">
-          <div className="flex-1 px-3 pb-32 pt-16 sm:px-5 sm:pb-36 sm:pt-16 md:px-6 md:pb-40 md:pt-8 lg:px-8 lg:pt-10">
+          <div className="flex-1 px-4 pb-36 pt-16 sm:px-6 sm:pb-40 sm:pt-16 md:px-8 md:pb-40 md:pt-10 lg:px-10 lg:pt-12">
             {messages.length === 0 ? (
-              <div className="flex min-h-[68vh] items-center justify-center px-2 sm:min-h-[70vh]">
-                <div className="max-w-3xl text-center">
-                  <h1 className="text-2xl font-semibold tracking-tight text-slate-900 sm:text-3xl md:text-4xl">
-                    Solution Architect GPT
+              <div className="mx-auto flex min-h-[68vh] max-w-3xl items-center justify-center">
+                <div className="w-full text-center">
+                  <h1 className="text-[26px] font-semibold tracking-tight text-slate-900 sm:text-[30px] md:text-[34px]">
+                    How can I help today?
                   </h1>
-                  <p className="mt-3 text-sm leading-7 text-slate-500 sm:mt-4 sm:text-base">
-                    Analyzes any business use case and recommends the best-fit digital, AI,
-                    automation, CRM, reminder, tracking, or website solution based on the actual
-                    problem and revenue opportunity.
+                  <p className="mx-auto mt-3 max-w-xl text-[14px] leading-6 text-slate-500 sm:mt-4 sm:text-[15px] sm:leading-7">
+                    Describe a business problem and get the best-fit digital, automation,
+                    CRM, or website solution.
                   </p>
 
-                  <div className="mt-8 grid grid-cols-1 gap-3 sm:grid-cols-2">
-                    {conversationStarters.map((starter) => (
+                  <div className="mt-9 grid grid-cols-1 gap-2 sm:mt-12 sm:grid-cols-2 sm:gap-2.5">
+                    {conversationStarters.map((starter, index) => (
                       <button
                         key={starter}
                         type="button"
                         onClick={() => handleAnalyze(starter)}
-                        className="rounded-2xl border border-slate-200 bg-white px-4 py-3 text-left text-sm text-slate-700 shadow-sm transition hover:border-slate-300 hover:bg-slate-50"
+                        className="group flex items-start gap-3 rounded-xl border border-slate-200 bg-white px-3.5 py-3 text-left transition hover:border-slate-300 hover:bg-slate-50"
                       >
-                        <p className="line-clamp-2 leading-6">{starter}</p>
+                        <span className="mt-0.5 flex h-5 w-5 shrink-0 items-center justify-center rounded-md bg-slate-100 text-slate-500 transition group-hover:bg-white group-hover:text-slate-700">
+                          <StarterIcon index={index} />
+                        </span>
+                        <span className="flex-1 text-[13px] leading-5 text-slate-700 sm:text-[13.5px]">
+                          {starter}
+                        </span>
                       </button>
                     ))}
                   </div>
                 </div>
               </div>
             ) : (
-              <div className="space-y-6">
+              <div className="mx-auto w-full max-w-3xl space-y-5 sm:space-y-6 lg:max-w-3xl xl:max-w-4xl">
                 {renderedMessages.map((message) => (
                   <section
                     key={message.id}
@@ -642,14 +982,14 @@ function App() {
                     <div
                       className={
                         message.role === 'user'
-                          ? 'w-auto max-w-[92%] rounded-[20px] border border-[#cfe0f5] bg-[#edf5ff] px-4 py-3 text-[14px] leading-6 text-slate-800 shadow-[0_10px_24px_rgba(125,147,178,0.12)] sm:max-w-[85%] sm:rounded-[22px] sm:px-5 sm:py-3.5 md:max-w-[78%] lg:max-w-2xl'
-                          : 'w-full pr-2 px-1 py-1 text-slate-700 sm:px-2 sm:py-2 sm:pr-3 lg:pr-4 xl:pr-5'
+                          ? 'w-auto max-w-[88%] rounded-3xl bg-slate-100 px-4 py-2.5 text-[14px] leading-6 text-slate-900 sm:max-w-[80%] sm:px-5 sm:py-3 sm:text-[15px] md:max-w-[70%]'
+                          : 'w-full px-0 py-1 text-slate-800 sm:py-2'
                       }
                     >
                       {message.role === 'user' ? (
                         <p className="whitespace-pre-wrap">{message.content}</p>
                       ) : (
-                        <article className="max-w-none text-[14px] leading-7 text-slate-700 sm:text-[15px] sm:leading-8">
+                        <article className="max-w-none text-[14.5px] leading-7 text-slate-800 sm:text-[15.5px] sm:leading-[1.75]">
                           <ReactMarkdown
                             remarkPlugins={[remarkGfm]}
                             components={{
@@ -736,27 +1076,25 @@ function App() {
                 ))}
 
                 {loading && !findStreamingMessage(messages)?.content ? (
-                  <section className="flex justify-start px-1 py-1 sm:px-2">
-                    <div className="flex items-center gap-2.5 sm:gap-3">
+                  <section className="flex justify-start py-1">
+                    <div className="flex items-center gap-3">
                       <div className="flex items-center gap-1.5">
-                        <span className="h-2 w-2 animate-bounce rounded-full bg-slate-400 [animation-delay:-0.3s]" />
-                        <span className="h-2 w-2 animate-bounce rounded-full bg-slate-400 [animation-delay:-0.15s]" />
-                        <span className="h-2 w-2 animate-bounce rounded-full bg-slate-400" />
+                        <span className="h-1.5 w-1.5 animate-bounce rounded-full bg-slate-400 [animation-delay:-0.3s]" />
+                        <span className="h-1.5 w-1.5 animate-bounce rounded-full bg-slate-400 [animation-delay:-0.15s]" />
+                        <span className="h-1.5 w-1.5 animate-bounce rounded-full bg-slate-400" />
                       </div>
-                      <div className="min-w-0">
-                        <p className="text-[13px] font-medium leading-5 text-slate-600 sm:text-[14px]">
-                          {findStreamingMessage(messages)?.content
-                            ? streamStatus || 'Generating response live'
-                            : loadingSteps[loadingStepIndex] || 'Analyzing request'}
-                        </p>
-                      </div>
+                      <p className="text-[13px] font-medium leading-5 text-slate-500 sm:text-[13.5px]">
+                        {findStreamingMessage(messages)?.content
+                          ? streamStatus || 'Generating response'
+                          : loadingSteps[loadingStepIndex] || 'Analyzing request'}
+                      </p>
                     </div>
                   </section>
                 ) : null}
 
                 {error ? (
                   <section className="flex justify-start">
-                    <div className="w-full rounded-[22px] bg-rose-50 px-4 py-4 text-sm text-rose-700 ring-1 ring-rose-200 sm:rounded-[28px] sm:px-5">
+                    <div className="w-full rounded-2xl bg-rose-50 px-4 py-3.5 text-[13.5px] leading-6 text-rose-700 ring-1 ring-rose-200">
                       {error}
                     </div>
                   </section>
@@ -767,8 +1105,8 @@ function App() {
             )}
           </div>
 
-          <div className="sticky bottom-0 px-3 pb-3 pt-2 sm:px-5 sm:pb-4 md:px-6 lg:px-8">
-            <div className="mx-auto max-w-5xl">
+          <div className="fixed bottom-0 left-0 right-0 z-10 bg-white px-3 pb-2 pt-3 sm:px-5 sm:pt-4 md:left-[260px] md:px-6 lg:px-8">
+            <div className="mx-auto max-w-3xl xl:max-w-4xl">
               <input
                 ref={fileInputRef}
                 type="file"
@@ -777,15 +1115,18 @@ function App() {
                 accept=".txt,.md,.json,.csv,.pdf,.doc,.docx,.rtf,.xlsx,.xls,.ppt,.pptx"
                 className="hidden"
               />
-              <div className={`rounded-[20px] border px-2.5 py-2 sm:rounded-[22px] sm:px-3 sm:py-2.5 md:rounded-[24px] ${ACCENT_INPUT_SURFACE_CLASS}`}>
-                {attachedFiles.length > 0 ? (
-                  <div className="mb-2 flex flex-wrap gap-2 px-1">
+              <div
+                className={`rounded-3xl border px-2 py-2 sm:px-2.5 sm:py-2 ${ACCENT_INPUT_SURFACE_CLASS}`}
+              >
+                {attachedFiles.length > 0 && !isVoiceModeOpen ? (
+                  <div className="mb-2 flex flex-wrap gap-2 px-2 pt-1">
                     {attachedFiles.map((file) => (
                       <div
                         key={file.id}
-                        className="inline-flex max-w-full items-center gap-2 rounded-full border border-slate-200 bg-slate-50 px-3 py-1.5 text-xs text-slate-700"
+                        className="inline-flex max-w-full items-center gap-2 rounded-full border border-slate-200 bg-slate-50 px-3 py-1 text-[12px] text-slate-700"
                       >
-                        <span className="truncate">{file.name}</span>
+                        <FileIcon />
+                        <span className="max-w-[160px] truncate">{file.name}</span>
                         <span className="text-slate-400">{file.statusLabel}</span>
                         <button
                           type="button"
@@ -800,12 +1141,24 @@ function App() {
                   </div>
                 ) : null}
 
-                <div className="flex items-end gap-2 sm:gap-3">
+                {isVoiceModeOpen ? (
+                  <VoiceBar
+                    state={voiceState}
+                    error={voiceError}
+                    isMuted={isVoiceMuted}
+                    sessionRef={voiceSessionRef}
+                    onEnd={handleCloseVoiceMode}
+                    onInterrupt={handleVoiceInterrupt}
+                    onToggleMute={handleToggleVoiceMute}
+                  />
+                ) : (
+                <div className="flex items-end gap-1 sm:gap-1.5">
                   <button
                     type="button"
                     onClick={handleOpenFilePicker}
-                    className="inline-flex h-10 w-10 shrink-0 items-center justify-center rounded-full text-slate-700 transition hover:bg-white/70"
+                    className={`inline-flex h-9 w-9 shrink-0 items-center justify-center rounded-full sm:h-10 sm:w-10 ${ACCENT_ICON_BUTTON_CLASS}`}
                     aria-label="Attach files"
+                    title="Attach files"
                   >
                     <PlusIcon />
                   </button>
@@ -815,80 +1168,298 @@ function App() {
                     value={businessInput}
                     onChange={(event) => setBusinessInput(event.target.value)}
                     onKeyDown={handleKeyDown}
-                    placeholder="Describe the business problem..."
-                    className="min-h-[42px] max-h-36 flex-1 resize-none overflow-y-auto border-0 bg-transparent px-1 py-2 text-[14px] leading-6 text-slate-800 outline-none placeholder:text-slate-400 sm:min-h-[44px] sm:text-[15px]"
+                    placeholder="Ask anything"
+                    className="min-h-[40px] max-h-36 flex-1 resize-none overflow-y-auto border-0 bg-transparent px-2 py-2 text-[14.5px] leading-6 text-slate-900 outline-none placeholder:text-slate-400 sm:min-h-[44px] sm:text-[15px]"
+                    rows={1}
                   />
 
                   <button
                     type="button"
                     onClick={handleSpeechToggle}
                     disabled={!speechSupported}
-                    className={`inline-flex h-10 w-10 shrink-0 items-center justify-center rounded-full transition ${
+                    className={`inline-flex h-9 w-9 shrink-0 items-center justify-center rounded-full transition sm:h-10 sm:w-10 ${
                       isListening
-                        ? 'bg-white text-rose-600 shadow-sm ring-1 ring-[#cfe0f5]'
-                        : `text-slate-600 disabled:cursor-not-allowed disabled:text-slate-300 ${ACCENT_ICON_BUTTON_CLASS}`
+                        ? 'bg-rose-50 text-rose-600 ring-1 ring-rose-200'
+                        : `disabled:cursor-not-allowed disabled:text-slate-300 ${ACCENT_ICON_BUTTON_CLASS}`
                     }`}
-                    aria-label={isListening ? 'Stop voice input' : 'Start voice input'}
+                    aria-label={isListening ? 'Stop dictation' : 'Dictate'}
+                    title="Dictate"
                   >
                     <MicIcon />
                   </button>
 
                   <button
                     type="button"
+                    onClick={handleOpenVoiceMode}
+                    className="inline-flex h-9 w-9 shrink-0 items-center justify-center rounded-full bg-slate-900 text-white shadow-sm transition hover:bg-slate-800 sm:h-10 sm:w-10"
+                    aria-label="Use voice"
+                    title="Use voice"
+                  >
+                    <VoiceWaveIcon />
+                  </button>
+
+                  <button
+                    type="button"
                     onClick={() => handleAnalyze()}
                     disabled={loading || (!businessInput.trim() && attachedFiles.length === 0)}
-                    className={`inline-flex h-10 w-10 shrink-0 items-center justify-center rounded-full disabled:cursor-not-allowed disabled:bg-white/80 disabled:text-slate-300 ${ACCENT_ICON_BUTTON_CLASS}`}
+                    className="inline-flex h-9 w-9 shrink-0 items-center justify-center rounded-full bg-slate-900 text-white shadow-sm transition hover:bg-slate-800 disabled:cursor-not-allowed disabled:bg-slate-200 disabled:text-slate-400 disabled:shadow-none sm:h-10 sm:w-10"
                     aria-label="Send"
+                    title="Send"
                   >
                     <SendArrowIcon />
                   </button>
                 </div>
+                )}
               </div>
-              {isParsingFiles ? (
-                <p className="mt-2 px-1 text-xs text-slate-500">Processing attached files...</p>
-              ) : null}
-              {attachmentError ? (
-                <p className="mt-2 px-1 text-xs text-rose-600">{attachmentError}</p>
-              ) : null}
-              {speechError ? (
-                <p className="mt-2 px-1 text-xs text-rose-600">{speechError}</p>
+
+              {isParsingFiles || attachmentError || speechError ? (
+                <div className="mt-1.5 flex items-center justify-between px-1 text-[11.5px] text-slate-400">
+                  <div>
+                    {isParsingFiles ? (
+                      <span>Processing attached files...</span>
+                    ) : attachmentError ? (
+                      <span className="text-rose-600">{attachmentError}</span>
+                    ) : speechError ? (
+                      <span className="text-rose-600">{speechError}</span>
+                    ) : null}
+                  </div>
+                </div>
               ) : null}
             </div>
           </div>
         </section>
       </main>
+
     </div>
   )
 }
 
-function MobileHeader({ isSidebarOpen, onToggle }) {
+function VoiceBar({ state, error, isMuted, sessionRef, onEnd, onInterrupt, onToggleMute }) {
+  const barsRef = useRef(null)
+  const rafRef = useRef(null)
+
+  useEffect(() => {
+    let lastUpdate = 0
+    const tick = (now) => {
+      if (now - lastUpdate > 50) {
+        lastUpdate = now
+        const session = sessionRef?.current
+        const bars = barsRef.current?.children
+        if (bars) {
+          const inputLevel = session?.getInputLevel?.() || 0
+          const outputLevel = session?.getOutputLevel?.() || 0
+          const level = Math.max(inputLevel, outputLevel)
+          const peaks = [0.4, 0.7, 1.0, 0.7, 0.4]
+          for (let i = 0; i < bars.length; i++) {
+            const h = Math.max(4, Math.round(peaks[i] * level * 22 + peaks[i] * 6))
+            bars[i].style.height = `${h}px`
+          }
+        }
+      }
+      rafRef.current = requestAnimationFrame(tick)
+    }
+    rafRef.current = requestAnimationFrame(tick)
+    return () => {
+      if (rafRef.current) cancelAnimationFrame(rafRef.current)
+    }
+  }, [sessionRef])
+
+  const isError = state === 'error' || Boolean(error)
+  const isConnecting = state === 'connecting'
+  const isSpeaking = state === 'speaking'
+  const isUserSpeaking = state === 'user_speaking'
+  const isThinking = state === 'thinking'
+
+  const statusText = isError
+    ? (error && error.length > 55 ? `${error.slice(0, 55)}…` : error) || 'Voice error'
+    : isMuted
+      ? 'Mic muted'
+      : isConnecting
+        ? 'Connecting…'
+        : isUserSpeaking
+          ? 'Listening…'
+          : isThinking
+            ? 'Thinking…'
+            : isSpeaking
+              ? 'Speaking…'
+              : 'Listening…'
+
+  const dotColor = isError
+    ? 'bg-rose-500'
+    : isMuted
+      ? 'bg-slate-400'
+      : isSpeaking
+        ? 'bg-blue-500'
+        : isUserSpeaking
+          ? 'bg-emerald-500'
+          : isThinking
+            ? 'bg-amber-500'
+            : 'bg-indigo-500'
+
+  const barColor = isError
+    ? 'bg-rose-300'
+    : isMuted
+      ? 'bg-slate-300'
+      : isSpeaking
+        ? 'bg-blue-400'
+        : isUserSpeaking
+          ? 'bg-emerald-400'
+          : isThinking
+            ? 'bg-amber-400'
+            : 'bg-indigo-400'
+
   return (
-    <div className="fixed left-0 right-0 top-0 z-20 flex items-center justify-end border-b border-slate-200 bg-white/90 px-3 py-3 backdrop-blur md:hidden">
+    <div className="flex items-center gap-2 px-2 py-2 sm:gap-3">
+      <span className="relative flex h-2.5 w-2.5 shrink-0">
+        {!isError && !isConnecting ? (
+          <span className={`absolute inline-flex h-full w-full animate-ping rounded-full ${dotColor} opacity-60`} />
+        ) : null}
+        <span className={`relative inline-flex h-2.5 w-2.5 rounded-full ${dotColor} ${isConnecting ? 'animate-pulse' : ''}`} />
+      </span>
+
+      <span className="flex-1 text-[13.5px] leading-6 text-slate-600 sm:text-[14px]">
+        {statusText}
+      </span>
+
+      <div ref={barsRef} className="flex items-center gap-[3px]">
+        {[0, 1, 2, 3, 4].map((i) => (
+          <span
+            key={i}
+            className={`w-[3px] rounded-full transition-all duration-75 ${barColor}`}
+            style={{ height: '6px' }}
+          />
+        ))}
+      </div>
+
       <button
         type="button"
-        onClick={onToggle}
-        className="inline-flex h-10 w-10 items-center justify-center rounded-full border border-slate-200 bg-white text-slate-700 shadow-sm"
-        aria-label={isSidebarOpen ? 'Close menu' : 'Open menu'}
+        onClick={onToggleMute}
+        disabled={isError || isConnecting}
+        className={`inline-flex h-8 w-8 shrink-0 items-center justify-center rounded-full transition disabled:cursor-not-allowed disabled:opacity-40 sm:h-9 sm:w-9 ${
+          isMuted
+            ? 'bg-rose-100 text-rose-600 hover:bg-rose-200'
+            : 'bg-transparent text-slate-500 hover:bg-slate-100 hover:text-slate-700'
+        }`}
+        aria-label={isMuted ? 'Unmute mic' : 'Mute mic'}
+        title={isMuted ? 'Unmute mic' : 'Mute mic'}
       >
-        <MenuIcon />
+        {isMuted ? <MicOffIcon /> : <MicIcon />}
+      </button>
+
+      {isSpeaking ? (
+        <button
+          type="button"
+          onClick={onInterrupt}
+          className="inline-flex h-8 items-center gap-1.5 rounded-full bg-slate-100 px-3 text-[12px] font-medium text-slate-700 transition hover:bg-slate-200 sm:h-9 sm:text-[12.5px]"
+        >
+          Interrupt
+        </button>
+      ) : null}
+
+      <button
+        type="button"
+        onClick={onEnd}
+        className="inline-flex h-8 items-center gap-1.5 rounded-full bg-rose-500 px-3 text-[12px] font-semibold text-white shadow-sm transition hover:bg-rose-600 sm:h-9 sm:px-4 sm:text-[12.5px]"
+        aria-label="End voice"
+      >
+        <span className="hidden sm:inline">End</span>
+        <CloseIcon />
       </button>
     </div>
   )
 }
 
+function MobileHeader({ isSidebarOpen, onToggle, onNewChat }) {
+  return (
+    <div className="fixed left-0 right-0 top-0 z-20 flex items-center justify-between border-b border-slate-200 bg-white/95 px-3 py-2.5 backdrop-blur md:hidden">
+      <button
+        type="button"
+        onClick={onToggle}
+        className="inline-flex h-9 w-9 items-center justify-center rounded-md text-slate-700 transition hover:bg-slate-100"
+        aria-label={isSidebarOpen ? 'Close menu' : 'Open menu'}
+      >
+        <MenuIcon />
+      </button>
+      <div className="flex items-center gap-2">
+        <div className="flex h-6 w-6 items-center justify-center rounded-md bg-slate-900 text-white">
+          <SparkIcon className="h-3.5 w-3.5" />
+        </div>
+        <p className="text-[14px] font-semibold tracking-tight text-slate-900">
+          Solution Architect
+        </p>
+      </div>
+      <button
+        type="button"
+        onClick={onNewChat}
+        className="inline-flex h-9 w-9 items-center justify-center rounded-md text-slate-700 transition hover:bg-slate-100"
+        aria-label="New chat"
+      >
+        <ComposeIcon />
+      </button>
+    </div>
+  )
+}
+
+function SparkIcon({ className = 'h-4 w-4' }) {
+  return (
+    <svg viewBox="0 0 24 24" fill="none" className={className} stroke="currentColor" strokeWidth="1.8" strokeLinecap="round" strokeLinejoin="round">
+      <path d="M12 3v3" />
+      <path d="M12 18v3" />
+      <path d="M3 12h3" />
+      <path d="M18 12h3" />
+      <path d="M5.6 5.6l2.1 2.1" />
+      <path d="M16.3 16.3l2.1 2.1" />
+      <path d="M5.6 18.4l2.1-2.1" />
+      <path d="M16.3 7.7l2.1-2.1" />
+      <circle cx="12" cy="12" r="3" fill="currentColor" stroke="none" />
+    </svg>
+  )
+}
+
+function StarterIcon({ index }) {
+  const icons = [
+    <svg key="0" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="1.8" className="h-3.5 w-3.5" strokeLinecap="round" strokeLinejoin="round">
+      <path d="M12 2v4" />
+      <path d="M12 18v4" />
+      <path d="m4.93 4.93 2.83 2.83" />
+      <path d="m16.24 16.24 2.83 2.83" />
+      <path d="M2 12h4" />
+      <path d="M18 12h4" />
+      <circle cx="12" cy="12" r="4" />
+    </svg>,
+    <svg key="1" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="1.8" className="h-3.5 w-3.5" strokeLinecap="round" strokeLinejoin="round">
+      <path d="M20.84 4.61a5.5 5.5 0 0 0-7.78 0L12 5.67l-1.06-1.06a5.5 5.5 0 0 0-7.78 7.78l1.06 1.06L12 21.23l7.78-7.78 1.06-1.06a5.5 5.5 0 0 0 0-7.78Z" />
+    </svg>,
+    <svg key="2" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="1.8" className="h-3.5 w-3.5" strokeLinecap="round" strokeLinejoin="round">
+      <rect x="3" y="4" width="18" height="18" rx="2" />
+      <path d="M16 2v4" />
+      <path d="M8 2v4" />
+      <path d="M3 10h18" />
+    </svg>,
+    <svg key="3" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="1.8" className="h-3.5 w-3.5" strokeLinecap="round" strokeLinejoin="round">
+      <path d="M3 3h18v6H3z" />
+      <path d="M3 15h18v6H3z" />
+      <path d="M7 12h10" />
+    </svg>,
+  ]
+  return icons[index % icons.length]
+}
+
+function FileIcon() {
+  return (
+    <svg viewBox="0 0 24 24" fill="none" className="h-3.5 w-3.5" stroke="currentColor" strokeWidth="2">
+      <path d="M14 3H7a2 2 0 0 0-2 2v14a2 2 0 0 0 2 2h10a2 2 0 0 0 2-2V8z" strokeLinejoin="round" />
+      <path d="M14 3v5h5" strokeLinejoin="round" />
+    </svg>
+  )
+}
+
 function ComposeIcon() {
   return (
-    <svg viewBox="0 0 24 24" fill="none" className="h-5 w-5" stroke="currentColor" strokeWidth="2">
-      <path
-        d="M12 20h9"
-        strokeLinecap="round"
-        strokeLinejoin="round"
-      />
-      <path
-        d="m16.5 3.5 4 4L8 20l-5 1 1-5 12.5-12.5Z"
-        strokeLinecap="round"
-        strokeLinejoin="round"
-      />
+    <svg viewBox="0 0 24 24" fill="none" className="h-[18px] w-[18px]" stroke="currentColor" strokeWidth="1.8" strokeLinecap="round" strokeLinejoin="round">
+      <path d="M12 20h9" />
+      <path d="M16.5 3.5a2.121 2.121 0 1 1 3 3L7 19l-4 1 1-4 12.5-12.5Z" />
+      <path d="M15 5l4 4" />
     </svg>
   )
 }
@@ -1348,6 +1919,40 @@ function MicIcon() {
       <path d="M12 15a3 3 0 0 0 3-3V8a3 3 0 1 0-6 0v4a3 3 0 0 0 3 3Z" />
       <path d="M19 11a7 7 0 0 1-14 0" strokeLinecap="round" />
       <path d="M12 18v3" strokeLinecap="round" />
+    </svg>
+  )
+}
+
+function MicOffIcon() {
+  return (
+    <svg viewBox="0 0 24 24" fill="none" className="h-5 w-5" stroke="currentColor" strokeWidth="2" strokeLinecap="round" strokeLinejoin="round">
+      <path d="M2 2l20 20" />
+      <path d="M9 9v3a3 3 0 0 0 5.12 2.12" />
+      <path d="M15 9.34V5a3 3 0 0 0-5.94-.6" />
+      <path d="M19 11a7 7 0 0 1-1.11 3.78" />
+      <path d="M5 11a7 7 0 0 0 11.16 5.66" />
+      <path d="M12 18v3" />
+    </svg>
+  )
+}
+
+function VoiceWaveIcon() {
+  return (
+    <svg viewBox="0 0 24 24" fill="none" className="h-5 w-5" stroke="currentColor" strokeWidth="2">
+      <path d="M5 10v4" strokeLinecap="round" />
+      <path d="M9 7v10" strokeLinecap="round" />
+      <path d="M12 4v16" strokeLinecap="round" />
+      <path d="M15 7v10" strokeLinecap="round" />
+      <path d="M19 10v4" strokeLinecap="round" />
+    </svg>
+  )
+}
+
+function CloseIcon() {
+  return (
+    <svg viewBox="0 0 24 24" fill="none" className="h-5 w-5" stroke="currentColor" strokeWidth="2">
+      <path d="M6 6l12 12" strokeLinecap="round" />
+      <path d="M18 6L6 18" strokeLinecap="round" />
     </svg>
   )
 }
